@@ -7,10 +7,13 @@ import pandas as pd
 import os
 import re
 import time
-import zipfile
 import glob
 import unicodedata
+import json
+import hashlib
 from datetime import datetime
+from typing import Optional
+from threading import Lock
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -22,6 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ======================== CONFIGURAÇÕES ========================
 PAGINA_ANP = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis"
 CSV_DATA_DIR = "data"
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
@@ -31,8 +35,21 @@ PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
 DIAS_PARA_CONSIDERAR_ANTIGO = 30
 
+# APIs de Dados Abertos
+BRASILAPI_CNPJ = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
+BRASILAPI_CEP = "https://brasilapi.com.br/api/cep/v2/{cep}"
+
+# Cache local de geolocalização
+GEO_CACHE_DIR = os.path.join(CSV_DATA_DIR, "geo_cache")
+GEO_CACHE_TTL_DIAS = 90
+
+# Controle de rate limit para BrasilAPI (evitar bloqueios)
+_rate_lock = Lock()
+_ultimo_request_brasilapi = [0.0]
+BRASILAPI_DELAY = 0.5  # segundos
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "CombustiveisANP/1.0 (contato@exemplo.com)"
 }
 
 PRODUTO_PALAVRAS = {
@@ -43,7 +60,10 @@ PRODUTO_PALAVRAS = {
     "glp": ["glp"],
 }
 
+os.makedirs(GEO_CACHE_DIR, exist_ok=True)
 
+
+# ======================== UTILITÁRIOS ========================
 def normalizar_texto(texto):
     if not texto:
         return ""
@@ -52,6 +72,229 @@ def normalizar_texto(texto):
     return sem_acento.upper().strip()
 
 
+def normalizar_cnpj(cnpj) -> str:
+    """Remove tudo que não é dígito."""
+    if not cnpj:
+        return ""
+    return re.sub(r"\D", "", str(cnpj))
+
+
+def _geo_cache_path(chave: str) -> str:
+    h = hashlib.md5(chave.encode("utf-8")).hexdigest()
+    return os.path.join(GEO_CACHE_DIR, f"{h}.json")
+
+
+def _ler_geo_cache(chave: str) -> Optional[dict]:
+    caminho = _geo_cache_path(chave)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        # Verifica TTL
+        if time.time() - dados.get("_ts", 0) > GEO_CACHE_TTL_DIAS * 86400:
+            return None
+        return dados
+    except Exception:
+        return None
+
+
+def _salvar_geo_cache(chave: str, dados: Optional[dict]):
+    caminho = _geo_cache_path(chave)
+    payload = dict(dados) if dados else {}
+    payload["_ts"] = time.time()
+    try:
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Erro ao salvar geo cache: {e}")
+
+
+def _respeitar_rate_limit():
+    """Garante um delay mínimo entre requisições para APIs públicas."""
+    with _rate_lock:
+        agora = time.time()
+        delta = agora - _ultimo_request_brasilapi[0]
+        if delta < BRASILAPI_DELAY:
+            time.sleep(BRASILAPI_DELAY - delta)
+        _ultimo_request_brasilapi[0] = time.time()
+
+
+# ======================== OPÇÃO 7: CNPJ -> Receita -> CEP -> Geolocalização ========================
+def obter_endereco_por_cnpj(cnpj: str) -> Optional[dict]:
+    """
+    Consulta a base da Receita Federal (via BrasilAPI) para obter o endereço
+    completo e CEP associado ao CNPJ.
+    """
+    cnpj_limpo = normalizar_cnpj(cnpj)
+    if len(cnpj_limpo) != 14:
+        return None
+
+    chave_cache = f"cnpj_{cnpj_limpo}"
+    cached = _ler_geo_cache(chave_cache)
+    if cached is not None:
+        return cached if cached.get("cep") else None
+
+    try:
+        _respeitar_rate_limit()
+        url = BRASILAPI_CNPJ.format(cnpj=cnpj_limpo)
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 404:
+            _salvar_geo_cache(chave_cache, None)
+            return None
+        r.raise_for_status()
+        dados = r.json()
+
+        # Extrai dados de endereço relevantes
+        resultado = {
+            "razao_social": dados.get("razao_social"),
+            "nome_fantasia": dados.get("nome_fantasia"),
+            "logradouro": dados.get("logradouro"),
+            "numero": dados.get("numero"),
+            "complemento": dados.get("complemento"),
+            "bairro": dados.get("bairro"),
+            "municipio": dados.get("municipio"),
+            "uf": dados.get("uf"),
+            "cep": dados.get("cep"),
+        }
+
+        _salvar_geo_cache(chave_cache, resultado)
+        return resultado
+
+    except Exception as e:
+        print(f"⚠️ Erro BrasilAPI CNPJ ({cnpj_limpo}): {e}")
+        return None
+
+
+def obter_coordenadas_por_cep(cep: str) -> Optional[dict]:
+    """
+    Geocodifica um CEP usando BrasilAPI (baseado em CNEFE/IBGE).
+    Retorna latitude/longitude.
+    """
+    cep_limpo = re.sub(r"\D", "", str(cep or ""))
+    if len(cep_limpo) != 8:
+        return None
+
+    chave_cache = f"cep_{cep_limpo}"
+    cached = _ler_geo_cache(chave_cache)
+    if cached is not None:
+        return cached if cached.get("latitude") else None
+
+    try:
+        _respeitar_rate_limit()
+        url = BRASILAPI_CEP.format(cep=cep_limpo)
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        if r.status_code == 404:
+            _salvar_geo_cache(chave_cache, None)
+            return None
+        r.raise_for_status()
+        dados = r.json()
+
+        coords = dados.get("location", {}).get("coordinates", {})
+        lat = coords.get("latitude")
+        lon = coords.get("longitude")
+
+        if lat is not None and lon is not None:
+            resultado = {
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "endereco_cep": dados.get("street"),
+                "bairro_cep": dados.get("neighborhood"),
+                "cidade_cep": dados.get("city"),
+                "uf_cep": dados.get("state"),
+            }
+            _salvar_geo_cache(chave_cache, resultado)
+            return resultado
+
+        _salvar_geo_cache(chave_cache, None)
+        return None
+
+    except Exception as e:
+        print(f"⚠️ Erro BrasilAPI CEP ({cep_limpo}): {e}")
+        return None
+
+
+def geolocalizar_posto_por_cnpj(cnpj: str, endereco_csv: str = "", bairro_csv: str = "",
+                                 municipio_csv: str = "", uf_csv: str = "") -> Optional[dict]:
+    """
+    Estratégia para máxima precisão:
+    1. Consulta a Receita (via CNPJ) para obter o CEP oficial.
+    2. Geocodifica o CEP para obter lat/lon precisas.
+    """
+    # Passo 1: Obtém endereço/CEP pela Receita Federal
+    dados_receita = obter_endereco_por_cnpj(cnpj)
+
+    cep = None
+    fonte_endereco = None
+
+    if dados_receita and dados_receita.get("cep"):
+        cep = dados_receita["cep"]
+        fonte_endereco = "receita_federal"
+    else:
+        # Fallback: tenta extrair CEP do CSV ou usar dados do CSV
+        # (O CSV da ANP geralmente não tem CEP, então isso é apenas uma segurança)
+        if endereco_csv:
+            # Tenta encontrar um padrão de CEP no endereço (improvável, mas seguro)
+            match = re.search(r"\d{5}-?\d{3}", endereco_csv)
+            if match:
+                cep = match.group()
+                fonte_endereco = "csv_anp"
+
+    # Passo 2: Geolocaliza pelo CEP
+    if cep:
+        geo = obter_coordenadas_por_cep(cep)
+        if geo:
+            geo["nivel_precisao"] = "cnpj_receita_cep"
+            geo["fonte_endereco"] = fonte_endereco
+            geo["cep_encontrado"] = cep
+            return geo
+
+    return None
+
+
+def enriquecer_postos_com_geo(postos: list, limite: int = None) -> list:
+    """
+    Enriquece lista de postos com lat/lon usando CNPJ como chave principal.
+    """
+    if limite:
+        postos_geo = postos[:limite]
+        postos_resto = postos[limite:]
+    else:
+        postos_geo = postos
+        postos_resto = []
+
+    for posto in postos_geo:
+        geo = geolocalizar_posto_por_cnpj(
+            cnpj=posto.get("cnpj", ""),
+            endereco_csv=posto.get("endereco", ""),
+            bairro_csv=posto.get("bairro", ""),
+            municipio_csv=posto.get("_municipio_original", ""),
+            uf_csv=posto.get("_uf_original", ""),
+        )
+        if geo:
+            posto["latitude"] = geo["latitude"]
+            posto["longitude"] = geo["longitude"]
+            posto["geo_fonte"] = geo.get("fonte_endereco", "desconhecida")
+            posto["geo_precisao"] = geo.get("nivel_precisao")
+            posto["geo_cep"] = geo.get("cep_encontrado")
+        else:
+            posto["latitude"] = None
+            posto["longitude"] = None
+            posto["geo_fonte"] = None
+            posto["geo_precisao"] = None
+            posto["geo_cep"] = None
+
+    for posto in postos_resto:
+        posto["latitude"] = None
+        posto["longitude"] = None
+        posto["geo_fonte"] = None
+        posto["geo_precisao"] = None
+        posto["geo_cep"] = None
+
+    return postos_geo + postos_resto
+
+
+# ======================== FUNÇÕES ANP (CSV) ========================
 def gerar_nome_csv(produto="gasolina"):
     agora = datetime.now()
     data_str = agora.strftime("%d%m%Y_%H%M")
@@ -173,15 +416,20 @@ def baixar_csv(tipo: str = "gasolina"):
 
 
 @app.get("/api/precos")
-def get_precos(municipio: str, uf: str, produto: str = None):
+def get_precos(
+    municipio: str,
+    uf: str,
+    produto: str = None,
+    com_geo: bool = Query(False, description="Inclui geolocalização (mais lento)"),
+    limite_geo: int = Query(30, description="Máximo de postos a geolocalizar"),
+):
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
 
-    # ⚠️ ALTERAÇÃO AQUI: adicionar GLP à lista de CSVs
     csvs_disponiveis = {
         "gasolina": obter_csv_mais_recente("gasolina"),
         "diesel": obter_csv_mais_recente("diesel"),
-        "glp": obter_csv_mais_recente("glp"),   # ← NOVO
+        "glp": obter_csv_mais_recente("glp"),
     }
 
     for tipo, caminho in csvs_disponiveis.items():
@@ -278,15 +526,21 @@ def get_precos(municipio: str, uf: str, produto: str = None):
                         preco = float(str(row[col_valor]).replace(",", "."))
                     except (ValueError, TypeError):
                         continue
-                    postos_lista.append({
+                    posto = {
                         "revenda": str(row[col_revenda]) if col_revenda else "",
-                        "cnpj": str(row[col_cnpj]) if col_cnpj else "",
+                        "cnpj": normalizar_cnpj(row[col_cnpj]) if col_cnpj else "",
                         "endereco": f"{row[col_endereco]}" if col_endereco else "",
                         "bairro": str(row[col_bairro]) if col_bairro else "",
                         "bandeira": str(row[col_bandeira]) if col_bandeira else "",
                         "produto": str(row[col_produto]) if col_produto else "",
                         "preco": round(preco, 2),
-                    })
+                        "_municipio_original": municipio,
+                        "_uf_original": uf,
+                    }
+                    postos_lista.append(posto)
+
+                if com_geo and postos_lista:
+                    postos_lista = enriquecer_postos_com_geo(postos_lista, limite=limite_geo)
 
                 if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
                     resultados[prod_label] = {
@@ -307,6 +561,7 @@ def get_precos(municipio: str, uf: str, produto: str = None):
     except Exception as e:
         print(f"❌ Erro: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/csvs-baixados")
 def listar_csvs_baixados():
@@ -381,6 +636,7 @@ def atualizar_agora():
     return {"status": "ok", "mensagem": "Verificação concluída."}
 
 
+# ======================== COMPOSIÇÃO PETROBRAS ========================
 def raspar_composicao_petrobras(produto="gasolina"):
     agora = time.time()
     if produto in PETROBRAS_CACHE:
@@ -392,7 +648,7 @@ def raspar_composicao_petrobras(produto="gasolina"):
         "gasolina": "https://precos.petrobras.com.br/precos-gasolina",
         "diesel": "https://precos.petrobras.com.br/precos-diesel",
         "glp": "https://precos.petrobras.com.br/precos-glp",
-        "gnv": "https://precos.petrobras.com.br/precos-gnv", 
+        "gnv": "https://precos.petrobras.com.br/precos-gnv",
     }
     url = urls.get(produto.lower())
     if not url:
@@ -461,7 +717,6 @@ def raspar_composicao_petrobras(produto="gasolina"):
 def get_composicao(uf: str = "BR", produto: str = "gasolina"):
     dados = raspar_composicao_petrobras(produto)
     if not dados:
-        # Fallback estático para cada produto
         fallback = {
             "gasolina": {
                 "parcela_petrobras": 2.08, "impostos_federais": 0.24,
@@ -476,14 +731,12 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
                 "periodo": "Fallback estático",
             },
             "gnv": {
-                # GNV vendido em m³ — composição baseada em gás natural
                 "parcela_petrobras": 2.40, "impostos_federais": 0.18,
                 "icms": 1.20, "biocombustivel": 0.00,
                 "margem_distribuicao_revenda": 0.90, "preco_medio_final": 4.68,
                 "periodo": "Fallback estático",
             },
             "glp": {
-                # GLP P13 (botijão 13kg) — composição baseada em propano/butano
                 "parcela_petrobras": 45.00, "impostos_federais": 3.50,
                 "icms": 12.00, "biocombustivel": 0.00,
                 "margem_distribuicao_revenda": 22.00, "preco_medio_final": 82.50,
@@ -506,6 +759,7 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
         }
 
     return {"uf": uf, "produto": produto, **dados}
+
 
 @app.get("/api/eletropostos")
 def get_eletropostos(
@@ -583,6 +837,7 @@ def get_eletropostos(
         raise HTTPException(status_code=502, detail=f"Erro ao consultar OCM: {str(e)}")
 
 
+# ======================== AGENDADOR ========================
 def verificar_e_baixar_novos_csvs():
     print(f"\n🔍 [AGENDADOR] Verificando...")
     for produto in PRODUTO_PALAVRAS.keys():

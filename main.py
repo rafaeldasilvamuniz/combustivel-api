@@ -28,12 +28,14 @@ app.add_middleware(
 # ======================== CONFIGURAÇÕES ========================
 PAGINA_ANP = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis"
 
-# ✅ API OFICIAL DE REVENDEDORES (traz TODOS os postos + lat/lon)
-ANP_REVENDEDORES_API = "https://revendedoresapi.anp.gov.br/v1/combustive"
+# ✅ API OFICIAL DE REVENDEDORES DA ANP (fonte completa com lat/lon)
+ANP_API_COMBUSTIVEIS = "https://revendedoresapi.anp.gov.br/v1/combustiveis"
+ANP_API_GLP = "https://revendedoresapi.anp.gov.br/v1/glp"
 
 CSV_DATA_DIR = "data"
-CACHE_DIR = os.path.join(CSV_DATA_DIR, "cache_revendedores")
-os.makedirs(CACHE_DIR, exist_ok=True)
+CACHE_API_DIR = os.path.join(CSV_DATA_DIR, "cache_api_anp")
+os.makedirs(CACHE_API_DIR, exist_ok=True)
+os.makedirs(CSV_DATA_DIR, exist_ok=True)
 
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
 OCM_BASE_URL = "https://api.openchargemap.io/v3"
@@ -42,18 +44,11 @@ PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
 DIAS_PARA_CONSIDERAR_ANTIGO = 30
 
-BRASILAPI_CNPJ = "https://brasilapi.com.br/api/cnpj/v1/{cnpj}"
-BRASILAPI_CEP = "https://brasilapi.com.br/api/cep/v2/{cep}"
-
-GEO_CACHE_DIR = os.path.join(CSV_DATA_DIR, "geo_cache")
-GEO_CACHE_TTL_DIAS = 90
-
-_rate_lock = Lock()
-_ultimo_request = [0.0]
-API_DELAY = 0.5
+# Cache da API de Revendedores (24h)
+API_CACHE_TTL_HORAS = 24
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json",
 }
 
@@ -71,7 +66,8 @@ def normalizar_texto(texto):
     if not texto:
         return ""
     nfkd = unicodedata.normalize("NFKD", str(texto))
-    return "".join(c for c in nfkd if not unicodedata.combining(c)).upper().strip()
+    sem_acento = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return sem_acento.upper().strip()
 
 
 def normalizar_cnpj(cnpj) -> str:
@@ -80,142 +76,186 @@ def normalizar_cnpj(cnpj) -> str:
     return re.sub(r"\D", "", str(cnpj))
 
 
-def _respeitar_rate_limit():
-    with _rate_lock:
-        agora = time.time()
-        delta = agora - _ultimo_request[0]
-        if delta < API_DELAY:
-            time.sleep(API_DELAY - delta)
-        _ultimo_request[0] = time.time()
-
-
-def _cache_path_municipio(municipio: str, uf: str) -> str:
-    chave = f"{normalizar_texto(municipio)}_{normalizar_texto(uf)}"
+def _api_cache_path(municipio: str, uf: str, tipo: str = "combustiveis") -> str:
+    chave = f"{tipo}_{normalizar_texto(municipio)}_{normalizar_texto(uf)}"
     h = hashlib.md5(chave.encode("utf-8")).hexdigest()
-    return os.path.join(CACHE_DIR, f"{h}.json")
+    return os.path.join(CACHE_API_DIR, f"{h}.json")
 
 
-# ======================== API REVENDEDORES ANP (FONTE OFICIAL COMPLETA) ========================
-def buscar_revendedores_api_anp(municipio: str, uf: str) -> list:
+def _ler_api_cache(municipio: str, uf: str, tipo: str = "combustiveis") -> Optional[list]:
+    caminho = _api_cache_path(municipio, uf, tipo)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            dados = json.load(f)
+        if time.time() - dados.get("_ts", 0) > API_CACHE_TTL_HORAS * 3600:
+            return None
+        return dados.get("postos", [])
+    except Exception:
+        return None
+
+
+def _salvar_api_cache(municipio: str, uf: str, postos: list, tipo: str = "combustiveis"):
+    caminho = _api_cache_path(municipio, uf, tipo)
+    try:
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump({"_ts": time.time(), "postos": postos}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Erro ao salvar cache API: {e}")
+
+
+# ======================== API REVENDEDORES ANP ========================
+def consultar_api_revendedores_anp(municipio: str, uf: str, tipo: str = "combustiveis") -> list:
     """
-    Consulta a API oficial da ANP para obter TODOS os postos de combustíveis
-    autorizados no município, com coordenadas geográficas quando disponíveis.
-    
-    Endpoint: https://revendedoresapi.anp.gov.br/v1/combustive
-    Parâmetros: UF e Município
+    Consulta a API oficial da ANP para obter TODOS os postos autorizados
+    no município, com coordenadas geográficas.
+
+    Endpoint: https://revendedoresapi.anp.gov.br/v1/combustiveis?municipio=VITORIA&uf=ES
     """
-    # Verifica cache local (24h)
-    cache_file = _cache_path_municipio(municipio, uf)
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                dados_cache = json.load(f)
-            if time.time() - dados_cache.get("_ts", 0) < 86400:
-                print(f"📦 API Revendedores: cache hit para {municipio}/{uf} ({len(dados_cache.get('postos', []))} postos)")
-                return dados_cache.get("postos", [])
-        except Exception:
-            pass
+    # Verifica cache
+    cached = _ler_api_cache(municipio, uf, tipo)
+    if cached is not None:
+        print(f"📦 API ANP cache: {municipio}/{uf} ({len(cached)} postos)")
+        return cached
+
+    base_url = ANP_API_COMBUSTIVEIS if tipo == "combustiveis" else ANP_API_GLP
 
     try:
-        _respeitar_rate_limit()
         params = {
-            "uf": uf.upper().strip(),
             "municipio": municipio.upper().strip(),
+            "uf": uf.upper().strip(),
+            "numeropagina": 1,
         }
-        print(f"📡 Consultando API Revendedores ANP: {municipio}/{uf}")
-        r = requests.get(ANP_REVENDEDORES_API, params=params, headers=HEADERS, timeout=30)
+
+        print(f"📡 Consultando API ANP: {base_url} - {municipio}/{uf}")
+        r = requests.get(base_url, params=params, headers=HEADERS, timeout=30)
         r.raise_for_status()
         dados = r.json()
 
-        # A API pode retornar lista direta ou dict com chave
+        # A API retorna um objeto com "items" e "paginas"
         if isinstance(dados, dict):
-            # Tenta chaves comuns
-            for chave in ["items", "data", "resultados", "postos", "value"]:
-                if chave in dados and isinstance(dados[chave], list):
-                    itens = dados[chave]
-                    break
-            else:
-                # Se for dict único, transforma em lista
-                itens = [dados] if dados else []
+            itens = dados.get("items", [])
+            total_paginas = dados.get("paginas", 1)
         elif isinstance(dados, list):
             itens = dados
+            total_paginas = 1
         else:
             itens = []
+            total_paginas = 1
 
         postos = []
         for item in itens:
             if not isinstance(item, dict):
                 continue
 
-            cnpj = normalizar_cnpj(item.get("CNPJ") or item.get("cnpj") or "")
+            cnpj = normalizar_cnpj(item.get("cnpj") or item.get("CNPJ") or "")
             if not cnpj:
                 continue
 
-            # Extrai coordenadas (vários nomes possíveis)
-            lat = item.get("Latitude") or item.get("latitude")
-            lon = item.get("Longitude") or item.get("longitude")
-            lat_anp4c = item.get("Latitude (ANP4C)") or item.get("latitude_anp4c")
-            lon_anp4c = item.get("Longitude (ANP4C)") or item.get("longitude_anp4c")
+            # Coordenadas: prioriza ANP4C (mais precisas)
+            lat = item.get("latitude") or item.get("Latitude")
+            lon = item.get("longitude") or item.get("Longitude")
+            lat_anp4c = item.get("latitude_anp4c") or item.get("Latitude (ANP4C)")
+            lon_anp4c = item.get("longitude_anp4c") or item.get("Longitude (ANP4C)")
 
-            # Prefere coordenadas ANP4C (mais precisas) se disponíveis
-            lat_final = None
-            lon_final = None
-            fonte_geo = None
-
-            for lat_try, lon_try, fonte in [
-                (lat_anp4c, lon_anp4c, "anp4c"),
-                (lat, lon, "declarada"),
-            ]:
-                if lat_try is not None and lon_try is not None:
+            lat_final, lon_final = None, None
+            for lat_try, lon_try in [(lat_anp4c, lon_anp4c), (lat, lon)]:
+                if lat_try and lon_try:
                     try:
                         lat_f = float(str(lat_try).replace(",", "."))
                         lon_f = float(str(lon_try).replace(",", "."))
                         if -90 <= lat_f <= 90 and -180 <= lon_f <= 180 and (lat_f != 0 or lon_f != 0):
-                            lat_final = lat_f
-                            lon_final = lon_f
-                            fonte_geo = fonte
+                            lat_final, lon_final = lat_f, lon_f
                             break
                     except (ValueError, TypeError):
-                        continue
+                        pass
 
             posto = {
                 "cnpj": cnpj,
-                "revenda": item.get("Razão Social") or item.get("razao_social") or item.get("RazaoSocial") or "",
-                "nome_fantasia": item.get("Nome Fantasia") or item.get("nome_fantasia") or "",
-                "endereco": item.get("Endereço") or item.get("endereco") or "",
-                "numero": item.get("Número") or item.get("numero") or "",
-                "complemento": item.get("Complemento") or item.get("complemento") or "",
-                "bairro": item.get("Bairro") or item.get("bairro") or "",
-                "municipio": item.get("Município") or item.get("municipio") or municipio,
-                "uf": item.get("UF") or item.get("uf") or uf,
-                "cep": item.get("CEP") or item.get("cep") or "",
-                "distribuidora": item.get("Distribuidora") or item.get("distribuidora") or "",
+                "revenda": item.get("razao_social") or item.get("Razão Social") or "",
+                "nome_fantasia": item.get("nome_fantasia") or item.get("Nome Fantasia") or "",
+                "endereco": item.get("endereco") or item.get("Endereço") or "",
+                "numero": item.get("numero") or item.get("Número") or "",
+                "complemento": item.get("complemento") or item.get("Complemento") or "",
+                "bairro": item.get("bairro") or item.get("Bairro") or "",
+                "municipio": item.get("municipio") or item.get("Município") or municipio,
+                "uf": item.get("uf") or item.get("UF") or uf,
+                "cep": item.get("cep") or item.get("CEP") or "",
+                "distribuidora": item.get("distribuidora") or item.get("Distribuidora") or "",
+                "autorizacao": item.get("autorizacao") or item.get("Autorização") or "",
                 "latitude": lat_final,
                 "longitude": lon_final,
-                "geo_fonte": f"api_revendedores_{fonte_geo}" if fonte_geo else None,
-                "geo_precisao": "oficial_anp" if fonte_geo else None,
-                "geo_acuracia_m": item.get("Estimativa de Acurácia (m)") or item.get("estimativa_acuracia"),
-                "validacao_geo": item.get("Validação") or item.get("validacao"),
+                "geo_fonte": "api_anp" if lat_final else None,
+                "geo_precisao": "oficial_anp" if lat_final else None,
+                "geo_acuracia_m": item.get("estimativa_acuracia") or item.get("Estimativa de Acurácia (m)"),
+                "validacao_geo": item.get("validacao") or item.get("Validação"),
             }
             postos.append(posto)
 
-        print(f"✅ API Revendedores: {len(postos)} postos encontrados em {municipio}/{uf}")
+        # Busca páginas adicionais se existirem
+        if total_paginas > 1:
+            for pagina in range(2, total_paginas + 1):
+                try:
+                    params["numeropagina"] = pagina
+                    r = requests.get(base_url, params=params, headers=HEADERS, timeout=30)
+                    if r.status_code == 200:
+                        dados_pag = r.json()
+                        itens_pag = dados_pag.get("items", []) if isinstance(dados_pag, dict) else []
+                        for item in itens_pag:
+                            cnpj = normalizar_cnpj(item.get("cnpj") or item.get("CNPJ") or "")
+                            if not cnpj:
+                                continue
+                            lat = item.get("latitude") or item.get("Latitude")
+                            lon = item.get("longitude") or item.get("Longitude")
+                            lat_anp4c = item.get("latitude_anp4c") or item.get("Latitude (ANP4C)")
+                            lon_anp4c = item.get("longitude_anp4c") or item.get("Longitude (ANP4C)")
+                            lat_final, lon_final = None, None
+                            for lat_try, lon_try in [(lat_anp4c, lon_anp4c), (lat, lon)]:
+                                if lat_try and lon_try:
+                                    try:
+                                        lat_f = float(str(lat_try).replace(",", "."))
+                                        lon_f = float(str(lon_try).replace(",", "."))
+                                        if -90 <= lat_f <= 90 and -180 <= lon_f <= 180 and (lat_f != 0 or lon_f != 0):
+                                            lat_final, lon_final = lat_f, lon_f
+                                            break
+                                    except (ValueError, TypeError):
+                                        pass
+                            postos.append({
+                                "cnpj": cnpj,
+                                "revenda": item.get("razao_social") or "",
+                                "endereco": item.get("endereco") or "",
+                                "bairro": item.get("bairro") or "",
+                                "municipio": item.get("municipio") or municipio,
+                                "uf": item.get("uf") or uf,
+                                "cep": item.get("cep") or "",
+                                "distribuidora": item.get("distribuidora") or "",
+                                "latitude": lat_final,
+                                "longitude": lon_final,
+                                "geo_fonte": "api_anp" if lat_final else None,
+                                "geo_precisao": "oficial_anp" if lat_final else None,
+                            })
+                except Exception as e:
+                    print(f"⚠️ Erro ao buscar página {pagina}: {e}")
 
-        # Salva cache
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump({"_ts": time.time(), "postos": postos}, f, ensure_ascii=False)
-        except Exception as e:
-            print(f"⚠️ Erro ao salvar cache: {e}")
+        # Remove duplicatas por CNPJ
+        vistos = {}
+        for p in postos:
+            vistos[p["cnpj"]] = p
+        postos = list(vistos.values())
 
+        print(f"✅ API ANP: {len(postos)} postos encontrados em {municipio}/{uf}")
+
+        _salvar_api_cache(municipio, uf, postos, tipo)
         return postos
 
     except requests.RequestException as e:
-        print(f"❌ Erro na API Revendedores ANP: {e}")
-        # Tenta usar cache expirado como fallback
-        if os.path.exists(cache_file):
+        print(f"❌ Erro na API ANP: {e}")
+        # Fallback: tenta cache expirado
+        caminho = _api_cache_path(municipio, uf, tipo)
+        if os.path.exists(caminho):
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
+                with open(caminho, "r", encoding="utf-8") as f:
                     dados_cache = json.load(f)
                 print(f"⚠️ Usando cache expirado para {municipio}/{uf}")
                 return dados_cache.get("postos", [])
@@ -223,54 +263,8 @@ def buscar_revendedores_api_anp(municipio: str, uf: str) -> list:
                 pass
         return []
     except Exception as e:
-        print(f"❌ Erro ao processar API Revendedores: {e}")
+        print(f"❌ Erro ao processar API ANP: {e}")
         return []
-
-
-# ======================== FALLBACK: BRASILAPI (se API ANP falhar) ========================
-def geolocalizar_por_brasilapi(cnpj: str, cep: str = "") -> Optional[dict]:
-    """Fallback: usa BrasilAPI (Receita Federal) para obter CEP e geocodificar."""
-    cnpj_limpo = normalizar_cnpj(cnpj)
-    if len(cnpj_limpo) != 14:
-        return None
-
-    # Tenta CEP direto primeiro
-    if cep:
-        cep_limpo = re.sub(r"\D", "", str(cep))
-        if len(cep_limpo) == 8:
-            try:
-                _respeitar_rate_limit()
-                r = requests.get(BRASILAPI_CEP.format(cep=cep_limpo), headers=HEADERS, timeout=10)
-                if r.status_code == 200:
-                    dados = r.json()
-                    coords = dados.get("location", {}).get("coordinates", {})
-                    lat, lon = coords.get("latitude"), coords.get("longitude")
-                    if lat and lon:
-                        return {"latitude": float(lat), "longitude": float(lon), "geo_fonte": "brasilapi_cep"}
-            except Exception:
-                pass
-
-    # Fallback: consulta CNPJ na BrasilAPI para obter CEP
-    try:
-        _respeitar_rate_limit()
-        r = requests.get(BRASILAPI_CNPJ.format(cnpj=cnpj_limpo), headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            dados = r.json()
-            cep_receita = dados.get("cep", "")
-            if cep_receita:
-                cep_limpo = re.sub(r"\D", "", cep_receita)
-                if len(cep_limpo) == 8:
-                    r2 = requests.get(BRASILAPI_CEP.format(cep=cep_limpo), headers=HEADERS, timeout=10)
-                    if r2.status_code == 200:
-                        dados2 = r2.json()
-                        coords = dados2.get("location", {}).get("coordinates", {})
-                        lat, lon = coords.get("latitude"), coords.get("longitude")
-                        if lat and lon:
-                            return {"latitude": float(lat), "longitude": float(lon), "geo_fonte": "brasilapi_cnpj"}
-    except Exception:
-        pass
-
-    return None
 
 
 # ======================== FUNÇÕES ANP (CSV DE PREÇOS) ========================
@@ -404,21 +398,18 @@ def get_precos(
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
 
-    # ============================================================
-    # PASSO 1: BUSCAR TODOS OS POSTOS NA API REVENDEDORES ANP
-    # ============================================================
     print(f"\n{'='*60}")
     print(f"🔍 BUSCANDO POSTOS EM {municipio}/{uf}")
     print(f"{'='*60}")
 
-    postos_api = buscar_revendedores_api_anp(municipio, uf)
-    print(f"📋 API Revendedores retornou: {len(postos_api)} postos")
-
-    if not postos_api and incluir_sem_preco:
-        print("⚠️ API Revendedores não retornou dados. Tentando fallback...")
+    # ============================================================
+    # PASSO 1: BUSCAR TODOS OS POSTOS NA API OFICIAL DA ANP
+    # ============================================================
+    postos_api = consultar_api_revendedores_anp(municipio, uf, "combustiveis")
+    print(f"📋 API ANP retornou: {len(postos_api)} postos autorizados")
 
     # ============================================================
-    # PASSO 2: BUSCAR PREÇOS NO CSV DA ANP
+    # PASSO 2: BUSCAR PREÇOS NOS CSVs DA ANP
     # ============================================================
     csvs_disponiveis = {
         "gasolina": obter_csv_mais_recente("gasolina"),
@@ -433,7 +424,7 @@ def get_precos(
             csvs_disponiveis[tipo] = obter_csv_mais_recente(tipo)
 
     # ============================================================
-    # PASSO 3: MERGE - API Revendedores + Preços do CSV
+    # PASSO 3: MERGE - API ANP + Preços do CSV
     # ============================================================
     resultados = {}
 
@@ -450,7 +441,6 @@ def get_precos(
 
         df.columns = [c.replace("ï»¿", "").strip() for c in df.columns]
 
-        # Detecta colunas do CSV de preços
         col_municipio = col_uf = col_produto = col_valor = col_revenda = None
         col_endereco = col_bairro = col_cnpj = col_bandeira = None
 
@@ -484,7 +474,6 @@ def get_precos(
         if df_filtrado.empty:
             continue
 
-        # Processa cada produto
         for prod_chave, prod_label in [
             ("GASOLINA ADITIVADA", "gasolina_aditivada"),
             ("GASOLINA", "gasolina"),
@@ -517,9 +506,7 @@ def get_precos(
             if df_prod.empty:
                 continue
 
-            print(f"  → {prod_label}: {len(df_prod)} linhas no CSV")
-
-            # Mapa CNPJ → preço (último preço = mais recente)
+            # Mapa CNPJ -> preço (último preço = mais recente)
             mapa_precos = {}
             for _, row in df_prod.iterrows():
                 try:
@@ -534,14 +521,12 @@ def get_precos(
                     "bandeira": str(row[col_bandeira]) if col_bandeira else "",
                 }
 
-            print(f"  → {len(mapa_precos)} CNPJs com preço para {prod_label}")
-
             # ============================================================
-            # MERGE: Combina API Revendedores (todos) + CSV Preços (com preço)
+            # MERGE: API ANP (todos) + CSV (com preço)
             # ============================================================
             postos_merge = {}
 
-            # 1. Adiciona TODOS os postos da API Revendedores
+            # 1. Adiciona TODOS os postos da API ANP
             for posto in postos_api:
                 cnpj = posto["cnpj"]
                 posto_copia = dict(posto)
@@ -558,7 +543,7 @@ def get_precos(
                     if dados_preco["bandeira"]:
                         postos_merge[cnpj]["bandeira"] = dados_preco["bandeira"]
                 else:
-                    # Posto com preço mas não está na API (improvável)
+                    # Posto com preço mas não na API
                     postos_merge[cnpj] = {
                         "cnpj": cnpj,
                         "revenda": f"Posto {cnpj}",
@@ -575,21 +560,7 @@ def get_precos(
             postos_lista = list(postos_merge.values())
 
             # ============================================================
-            # GEOLOCALIZAÇÃO FALLBACK (para quem ainda não tem lat/lon)
-            # ============================================================
-            sem_geo = [p for p in postos_lista if not p.get("latitude") or not p.get("longitude")]
-            print(f"  → {len(sem_geo)} postos sem coordenadas (fallback BrasilAPI)")
-
-            for posto in sem_geo[:20]:  # limita a 20 para não travar
-                geo = geolocalizar_por_brasilapi(posto.get("cnpj", ""), posto.get("cep", ""))
-                if geo:
-                    posto["latitude"] = geo["latitude"]
-                    posto["longitude"] = geo["longitude"]
-                    posto["geo_fonte"] = geo["geo_fonte"]
-                    posto["geo_precisao"] = "aproximado_brasilapi"
-
-            # ============================================================
-            # ESTATÍSTICAS (apenas com preço)
+            # ESTATÍSTICAS
             # ============================================================
             precos_validos = [
                 p["preco"] for p in postos_lista
@@ -603,7 +574,7 @@ def get_precos(
             maximo = round(max(precos_validos), 2)
 
             # ============================================================
-            # ORDENAÇÃO: com preço primeiro (menor→maior), sem preço depois
+            # ORDENAÇÃO: com preço primeiro (menor->maior), sem preço depois
             # ============================================================
             postos_lista.sort(key=lambda p: (
                 0 if isinstance(p.get("preco"), (int, float)) else 1,
@@ -613,7 +584,7 @@ def get_precos(
             com_preco = sum(1 for p in postos_lista if isinstance(p.get("preco"), (int, float)))
             sem_preco = len(postos_lista) - com_preco
 
-            print(f"  ✅ {prod_label}: {len(postos_lista)} postos totais ({com_preco} com preço, {sem_preco} sem)")
+            print(f"  ✅ {prod_label}: {len(postos_lista)} postos ({com_preco} com preço, {sem_preco} sem)")
 
             if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
                 resultados[prod_label] = {
@@ -632,13 +603,13 @@ def get_precos(
             "municipio": municipio,
             "uf": uf,
             "produtos": {},
-            "fonte_api_revendedores": len(postos_api),
+            "fonte_api_anp": len(postos_api),
         }
 
     return {
         "municipio": municipio,
         "uf": uf,
-        "fonte_api_revendedores": len(postos_api),
+        "fonte_api_anp": len(postos_api),
         "produtos": resultados,
     }
 

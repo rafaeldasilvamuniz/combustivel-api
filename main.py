@@ -35,7 +35,8 @@ PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
 DIAS_PARA_CONSIDERAR_ANTIGO = 30
 
-API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustiveis"
+#API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustiveis"
+API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustivel"
 API_CACHE_TTL_HORAS = 24
 
 BRASILAPI_CEP_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
@@ -353,6 +354,53 @@ def apagar_csv(caminho):
 @app.get("/")
 def health():
     return {"status": "ok", "service": "combustivel"}
+
+@app.get("/api/testar-api-anp")
+def testar_api_anp(municipio: str = "VITORIA", uf: str = "ES"):
+    """
+    Testa a API ANP diretamente, mostrando o retorno bruto.
+    Útil para diagnosticar por que a API está retornando 0 postos.
+    """
+    resultado = {
+        "url_configurada": API_ANP_REVENDEDORES,
+        "parametros_enviados": {"municipio": municipio.upper(), "uf": uf.upper()},
+        "status_code": None,
+        "url_completa": None,
+        "tipo_resposta": None,
+        "chaves": None,
+        "total_items": 0,
+        "primeiro_item": None,
+        "erro": None,
+    }
+
+    try:
+        params = {"municipio": municipio.upper().strip(), "uf": uf.upper().strip()}
+        r = requests.get(API_ANP_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
+        resultado["status_code"] = r.status_code
+        resultado["url_completa"] = r.url
+
+        try:
+            dados = r.json()
+            if isinstance(dados, dict):
+                resultado["tipo_resposta"] = "dict"
+                resultado["chaves"] = list(dados.keys())
+                itens = dados.get("items", [])
+                resultado["total_items"] = len(itens)
+                if itens:
+                    resultado["primeiro_item"] = itens[0]
+            elif isinstance(dados, list):
+                resultado["tipo_resposta"] = "list"
+                resultado["total_items"] = len(dados)
+                if dados:
+                    resultado["primeiro_item"] = dados[0]
+        except Exception as e:
+            resultado["erro_parse_json"] = str(e)
+            resultado["resposta_bruta"] = r.text[:1500]
+
+    except Exception as e:
+        resultado["erro"] = str(e)
+
+    return resultado
 
 
 def encontrar_link_csv_anp(produto="gasolina"):

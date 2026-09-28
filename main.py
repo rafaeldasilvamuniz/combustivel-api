@@ -35,7 +35,7 @@ PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
 DIAS_PARA_CONSIDERAR_ANTIGO = 30
 
-#API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustiveis"
+# ✅ URL CORRETA da API ANP — municipio + uf como query string
 API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustivel"
 API_CACHE_TTL_HORAS = 24
 
@@ -170,6 +170,11 @@ def enriquecer_postos_sem_coordenada(postos: list, limite: int = 40) -> list:
 
 # ======================== API ANP ========================
 def buscar_postos_anp_api(municipio: str, uf: str) -> list:
+    """
+    Consulta a API oficial da ANP.
+    URL: https://revendedoresapi.anp.gov.br/v1/combustivel?municipio=VITORIA&uf=ES
+    A resposta vem em {"data": [...], "searchPageFilter": {...}}
+    """
     cache_file = _api_cache_path(municipio, uf)
     if os.path.exists(cache_file):
         try:
@@ -184,50 +189,39 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
 
     postos = []
     try:
-        params = {"municipio": municipio.upper().strip(), "uf": uf.upper().strip()}
-        print(f"📡 [API ANP] consultando {municipio}/{uf}...")
+        params = {
+            "municipio": municipio.upper().strip(),
+            "uf": uf.upper().strip(),
+        }
+        print(f"📡 [API ANP] consultando {API_ANP_REVENDEDORES} params={params}...")
         r = requests.get(API_ANP_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
+        print(f"📡 [API ANP] status: {r.status_code}")
         r.raise_for_status()
         dados = r.json()
 
+        # ✅ A resposta é {"status":..., "data": [...], "searchPageFilter": {...}}
+        itens = []
         if isinstance(dados, dict):
-            itens = dados.get("items", [])
-            try:
-                total_paginas = int(dados.get("paginas", 1) or 1)
-            except (ValueError, TypeError):
-                total_paginas = 1
+            itens = dados.get("data") or dados.get("items") or []
+            if not isinstance(itens, list):
+                itens = []
         elif isinstance(dados, list):
             itens = dados
-            total_paginas = 1
-        else:
-            itens = []
-            total_paginas = 1
+
+        print(f"📡 [API ANP] {len(itens)} registros brutos recebidos")
 
         for item in itens:
             posto = _extrair_posto_api(item, municipio, uf)
             if posto:
                 postos.append(posto)
 
-        for pagina in range(2, total_paginas + 1):
-            try:
-                params["numeropagina"] = pagina
-                r = requests.get(API_ANP_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
-                if r.status_code == 200:
-                    d = r.json()
-                    itens_pag = d.get("items", []) if isinstance(d, dict) else []
-                    for item in itens_pag:
-                        posto = _extrair_posto_api(item, municipio, uf)
-                        if posto:
-                            postos.append(posto)
-            except Exception as e:
-                print(f"⚠️ [API ANP] erro página {pagina}: {e}")
-
+        # Deduplica por CNPJ
         unicos = {}
         for p in postos:
             unicos[p["cnpj"]] = p
         postos = list(unicos.values())
 
-        print(f"✅ [API ANP] {len(postos)} postos em {municipio}/{uf}")
+        print(f"✅ [API ANP] {len(postos)} postos únicos em {municipio}/{uf}")
 
         try:
             with open(cache_file, "w", encoding="utf-8") as f:
@@ -250,6 +244,24 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
 
 
 def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
+    """
+    Extrai os campos de um item da API ANP.
+    Estrutura real da ANP:
+    {
+      "codigoSIMP": "1061308",
+      "razaoSocial": "J. S. PETROLEO E COMERCIO LTDA.",
+      "cnpj": "08788618000170",
+      "endereco": "AVENIDA DANTE MICHELINI,  2461",
+      "bairro": "MATA DA PRAIA",
+      "cep": "29066430",
+      "uf": "ES",
+      "municipio": "VITORIA",
+      "distribuidora": "RAIZEN",
+      "latitude": "-20.2746653",
+      "longitude": "-40.2826189",
+      ...
+    }
+    """
     if not isinstance(item, dict):
         return None
 
@@ -257,40 +269,44 @@ def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
     if not cnpj:
         return None
 
-    lat = item.get("latitude") or item.get("Latitude")
-    lon = item.get("longitude") or item.get("Longitude")
-    lat4 = item.get("latitude_anp4c") or item.get("Latitude (ANP4C)")
-    lon4 = item.get("longitude_anp4c") or item.get("Longitude (ANP4C)")
+    # Coordenadas vêm como strings em decimal
+    lat_str = item.get("latitude") or item.get("Latitude")
+    lon_str = item.get("longitude") or item.get("Longitude")
 
     lat_f = lon_f = None
-    for lt, ln in [(lat4, lon4), (lat, lon)]:
-        if lt and ln:
-            try:
-                a = float(str(lt).replace(",", "."))
-                b = float(str(ln).replace(",", "."))
-                if -90 <= a <= 90 and -180 <= b <= 180 and (a != 0 or b != 0):
-                    lat_f, lon_f = a, b
-                    break
-            except (ValueError, TypeError):
-                continue
+    try:
+        if lat_str not in (None, ""):
+            a = float(str(lat_str).replace(",", "."))
+            if -90 <= a <= 90 and a != 0:
+                lat_f = a
+    except (ValueError, TypeError):
+        pass
+    try:
+        if lon_str not in (None, ""):
+            b = float(str(lon_str).replace(",", "."))
+            if -180 <= b <= 180 and b != 0:
+                lon_f = b
+    except (ValueError, TypeError):
+        pass
 
+    # Endereço já vem completo: "AVENIDA DANTE MICHELINI,  2461"
     endereco = item.get("endereco") or item.get("Endereço") or ""
-    numero = item.get("numero") or item.get("Número") or ""
-    endereco_completo = endereco
-    if numero:
-        endereco_completo = f"{endereco}, {numero}"
+    endereco = re.sub(r"\s+", " ", str(endereco)).strip().strip(",")
+
+    if not endereco:
+        endereco = "Endereço não disponível na base ANP"
 
     return {
         "cnpj": cnpj,
-        "revenda": item.get("razao_social") or item.get("Razão Social") or "",
-        "nome_fantasia": item.get("nome_fantasia") or item.get("Nome Fantasia") or "",
-        "endereco": endereco_completo.strip(", "),
+        "revenda": item.get("razaoSocial") or item.get("razao_social") or item.get("Razão Social") or "",
+        "nome_fantasia": item.get("nomeFantasia") or item.get("nome_fantasia") or "",
+        "endereco": endereco,
         "bairro": item.get("bairro") or item.get("Bairro") or "",
         "municipio": item.get("municipio") or item.get("Município") or municipio,
         "uf": item.get("uf") or item.get("UF") or uf,
-        "cep": item.get("cep") or item.get("CEP") or "",
+        "cep": str(item.get("cep") or item.get("CEP") or "").strip(),
         "distribuidora": item.get("distribuidora") or item.get("Distribuidora") or "",
-        "bandeira": item.get("bandeira") or item.get("Bandeira") or "",
+        "bandeira": item.get("distribuidora") or item.get("Distribuidora") or "",
         "latitude": lat_f,
         "longitude": lon_f,
     }
@@ -355,48 +371,52 @@ def apagar_csv(caminho):
 def health():
     return {"status": "ok", "service": "combustivel"}
 
+
 @app.get("/api/testar-api-anp")
 def testar_api_anp(municipio: str = "VITORIA", uf: str = "ES"):
     """
     Testa a API ANP diretamente, mostrando o retorno bruto.
-    Útil para diagnosticar por que a API está retornando 0 postos.
     """
+    params = {"municipio": municipio.upper(), "uf": uf.upper()}
+    url = API_ANP_REVENDEDORES
+
     resultado = {
-        "url_configurada": API_ANP_REVENDEDORES,
-        "parametros_enviados": {"municipio": municipio.upper(), "uf": uf.upper()},
+        "municipio": municipio, "uf": uf,
+        "url_testada": f"{url}?municipio={params['municipio']}&uf={params['uf']}",
         "status_code": None,
-        "url_completa": None,
+        "content_type": None,
         "tipo_resposta": None,
         "chaves": None,
         "total_items": 0,
+        "total_registro_anp": None,
         "primeiro_item": None,
+        "primeiro_item_extraido": None,
         "erro": None,
     }
 
     try:
-        params = {"municipio": municipio.upper().strip(), "uf": uf.upper().strip()}
-        r = requests.get(API_ANP_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
         resultado["status_code"] = r.status_code
-        resultado["url_completa"] = r.url
+        resultado["content_type"] = r.headers.get("content-type")
 
-        try:
-            dados = r.json()
-            if isinstance(dados, dict):
-                resultado["tipo_resposta"] = "dict"
-                resultado["chaves"] = list(dados.keys())
-                itens = dados.get("items", [])
-                resultado["total_items"] = len(itens)
-                if itens:
-                    resultado["primeiro_item"] = itens[0]
-            elif isinstance(dados, list):
-                resultado["tipo_resposta"] = "list"
-                resultado["total_items"] = len(dados)
-                if dados:
-                    resultado["primeiro_item"] = dados[0]
-        except Exception as e:
-            resultado["erro_parse_json"] = str(e)
-            resultado["resposta_bruta"] = r.text[:1500]
-
+        dados = r.json()
+        if isinstance(dados, dict):
+            resultado["tipo_resposta"] = "dict"
+            resultado["chaves"] = list(dados.keys())
+            # ✅ Lê "data" (não "items")
+            itens = dados.get("data") or dados.get("items") or []
+            resultado["total_items"] = len(itens)
+            filtro = dados.get("searchPageFilter") or {}
+            resultado["total_registro_anp"] = filtro.get("totalRegistro")
+            if itens:
+                resultado["primeiro_item"] = itens[0]
+                resultado["primeiro_item_extraido"] = _extrair_posto_api(itens[0], municipio, uf)
+        elif isinstance(dados, list):
+            resultado["tipo_resposta"] = "list"
+            resultado["total_items"] = len(dados)
+            if dados:
+                resultado["primeiro_item"] = dados[0]
+                resultado["primeiro_item_extraido"] = _extrair_posto_api(dados[0], municipio, uf)
     except Exception as e:
         resultado["erro"] = str(e)
 
@@ -564,7 +584,7 @@ def get_precos(
                 else:
                     df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
 
-                # ✅ Mapa CNPJ normalizado (sem máscara) → preço
+                # Mapa CNPJ normalizado → preço
                 mapa_precos = {}
                 if not df_prod.empty:
                     for _, row in df_prod.iterrows():
@@ -575,13 +595,12 @@ def get_precos(
                         cnpj_limpo = normalizar_cnpj(row[col_cnpj]) if col_cnpj else ""
                         if not cnpj_limpo:
                             continue
-                        # ✅ Mantém o ÚLTIMO preço lido (mais recente no CSV)
                         mapa_precos[cnpj_limpo] = {
                             "preco": round(preco, 2),
                             "bandeira": str(row[col_bandeira]) if col_bandeira else "",
                         }
 
-                # ✅ MERGE com chaves normalizadas
+                # MERGE
                 postos_merge = {}
 
                 # 1. Todos os postos da API ANP
@@ -589,13 +608,13 @@ def get_precos(
                     cnpj_key = normalizar_cnpj(p["cnpj"])
                     postos_merge[cnpj_key] = {
                         **p,
-                        "cnpj": cnpj_key,       # ← garante CNPJ limpo no retorno
-                        "preco": 0.0,           # ← zero quando não tem preço
+                        "cnpj": cnpj_key,
+                        "preco": 0.0,
                         "tem_preco": False,
                         "produto": prod_label.upper(),
                     }
 
-                # 2. Sobrepõe com preços (mesma chave normalizada)
+                # 2. Sobrepõe com preços
                 for cnpj_limpo, dados_preco in mapa_precos.items():
                     if cnpj_limpo in postos_merge:
                         postos_merge[cnpj_limpo]["preco"] = dados_preco["preco"]
@@ -603,11 +622,11 @@ def get_precos(
                         if dados_preco["bandeira"]:
                             postos_merge[cnpj_limpo]["bandeira"] = dados_preco["bandeira"]
                     else:
-                        # Posto com preço mas que não está na base ANP
+                        # Posto com preço mas que NÃO está na base ANP
                         postos_merge[cnpj_limpo] = {
                             "cnpj": cnpj_limpo,
                             "revenda": f"Posto {cnpj_limpo}",
-                            "endereco": "",
+                            "endereco": "Endereço não disponível na base ANP",
                             "bairro": "",
                             "municipio": municipio,
                             "uf": uf,
@@ -618,11 +637,11 @@ def get_precos(
                             "produto": prod_label.upper(),
                             "latitude": None,
                             "longitude": None,
+                            "aviso": "Endereço não disponível na base ANP",
                         }
 
                 postos_lista = list(postos_merge.values())
 
-                # ✅ Só considera "com preço" quem tem preco > 0
                 precos_validos = [
                     p["preco"] for p in postos_lista
                     if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0
@@ -644,7 +663,6 @@ def get_precos(
                 else:
                     media = minimo = maximo = None
 
-                # ✅ Ordenação: com preço (menor→maior) → sem preço (alfabético)
                 postos_lista.sort(key=lambda p: (
                     0 if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 1,
                     p["preco"] if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 9999,

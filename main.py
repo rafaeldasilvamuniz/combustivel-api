@@ -43,10 +43,10 @@ BRASILAPI_CEP = "https://brasilapi.com.br/api/cep/v2/{cep}"
 GEO_CACHE_DIR = os.path.join(CSV_DATA_DIR, "geo_cache")
 GEO_CACHE_TTL_DIAS = 90
 
-# Controle de rate limit para BrasilAPI (evitar bloqueios)
+# Controle de rate limit para BrasilAPI
 _rate_lock = Lock()
 _ultimo_request_brasilapi = [0.0]
-BRASILAPI_DELAY = 0.5  # segundos
+BRASILAPI_DELAY = 0.5
 
 HEADERS = {
     "User-Agent": "CombustiveisANP/1.0 (contato@exemplo.com)"
@@ -91,7 +91,6 @@ def _ler_geo_cache(chave: str) -> Optional[dict]:
     try:
         with open(caminho, "r", encoding="utf-8") as f:
             dados = json.load(f)
-        # Verifica TTL
         if time.time() - dados.get("_ts", 0) > GEO_CACHE_TTL_DIAS * 86400:
             return None
         return dados
@@ -111,7 +110,6 @@ def _salvar_geo_cache(chave: str, dados: Optional[dict]):
 
 
 def _respeitar_rate_limit():
-    """Garante um delay mínimo entre requisições para APIs públicas."""
     with _rate_lock:
         agora = time.time()
         delta = agora - _ultimo_request_brasilapi[0]
@@ -120,12 +118,55 @@ def _respeitar_rate_limit():
         _ultimo_request_brasilapi[0] = time.time()
 
 
-# ======================== OPÇÃO 7: CNPJ -> Receita -> CEP -> Geolocalização ========================
+# ======================== DEDUPLICAÇÃO POR CNPJ ========================
+def deduplicar_por_cnpj(postos: list) -> list:
+    """
+    Remove duplicatas mantendo UM registro por CNPJ.
+    Se CNPJ estiver vazio, usa (revenda + endereco + bairro) como chave.
+    Em caso de preços diferentes para o mesmo CNPJ (coletas de semanas
+    diferentes no CSV da ANP), mantém o MENOR preço.
+    """
+    if not postos:
+        return []
+
+    mapa = {}
+    removidos = 0
+
+    for p in postos:
+        if not isinstance(p, dict):
+            continue
+
+        cnpj = normalizar_cnpj(p.get("cnpj", ""))
+        if cnpj:
+            chave = f"cnpj:{cnpj}"
+        else:
+            chave = (
+                "nm:"
+                f"{normalizar_texto(p.get('revenda', ''))}|"
+                f"{normalizar_texto(p.get('endereco', ''))}|"
+                f"{normalizar_texto(p.get('bairro', ''))}"
+            )
+
+        preco = p.get("preco")
+
+        if chave not in mapa:
+            mapa[chave] = p
+        else:
+            removidos += 1
+            atual = mapa[chave]
+            preco_atual = atual.get("preco")
+            if isinstance(preco, (int, float)) and (
+                not isinstance(preco_atual, (int, float)) or preco < preco_atual
+            ):
+                mapa[chave] = p
+
+    resultado = list(mapa.values())
+    print(f"🧹 Deduplicação: {len(postos)} → {len(resultado)} (removidos: {removidos})")
+    return resultado
+
+
+# ======================== GEOLOCALIZAÇÃO (Opção 7) ========================
 def obter_endereco_por_cnpj(cnpj: str) -> Optional[dict]:
-    """
-    Consulta a base da Receita Federal (via BrasilAPI) para obter o endereço
-    completo e CEP associado ao CNPJ.
-    """
     cnpj_limpo = normalizar_cnpj(cnpj)
     if len(cnpj_limpo) != 14:
         return None
@@ -145,7 +186,6 @@ def obter_endereco_por_cnpj(cnpj: str) -> Optional[dict]:
         r.raise_for_status()
         dados = r.json()
 
-        # Extrai dados de endereço relevantes
         resultado = {
             "razao_social": dados.get("razao_social"),
             "nome_fantasia": dados.get("nome_fantasia"),
@@ -167,10 +207,6 @@ def obter_endereco_por_cnpj(cnpj: str) -> Optional[dict]:
 
 
 def obter_coordenadas_por_cep(cep: str) -> Optional[dict]:
-    """
-    Geocodifica um CEP usando BrasilAPI (baseado em CNEFE/IBGE).
-    Retorna latitude/longitude.
-    """
     cep_limpo = re.sub(r"\D", "", str(cep or ""))
     if len(cep_limpo) != 8:
         return None
@@ -216,12 +252,6 @@ def obter_coordenadas_por_cep(cep: str) -> Optional[dict]:
 
 def geolocalizar_posto_por_cnpj(cnpj: str, endereco_csv: str = "", bairro_csv: str = "",
                                  municipio_csv: str = "", uf_csv: str = "") -> Optional[dict]:
-    """
-    Estratégia para máxima precisão:
-    1. Consulta a Receita (via CNPJ) para obter o CEP oficial.
-    2. Geocodifica o CEP para obter lat/lon precisas.
-    """
-    # Passo 1: Obtém endereço/CEP pela Receita Federal
     dados_receita = obter_endereco_por_cnpj(cnpj)
 
     cep = None
@@ -230,17 +260,12 @@ def geolocalizar_posto_por_cnpj(cnpj: str, endereco_csv: str = "", bairro_csv: s
     if dados_receita and dados_receita.get("cep"):
         cep = dados_receita["cep"]
         fonte_endereco = "receita_federal"
-    else:
-        # Fallback: tenta extrair CEP do CSV ou usar dados do CSV
-        # (O CSV da ANP geralmente não tem CEP, então isso é apenas uma segurança)
-        if endereco_csv:
-            # Tenta encontrar um padrão de CEP no endereço (improvável, mas seguro)
-            match = re.search(r"\d{5}-?\d{3}", endereco_csv)
-            if match:
-                cep = match.group()
-                fonte_endereco = "csv_anp"
+    elif endereco_csv:
+        match = re.search(r"\d{5}-?\d{3}", endereco_csv)
+        if match:
+            cep = match.group()
+            fonte_endereco = "csv_anp"
 
-    # Passo 2: Geolocaliza pelo CEP
     if cep:
         geo = obter_coordenadas_por_cep(cep)
         if geo:
@@ -254,29 +279,38 @@ def geolocalizar_posto_por_cnpj(cnpj: str, endereco_csv: str = "", bairro_csv: s
 
 def enriquecer_postos_com_geo(postos: list, limite: int = None) -> list:
     """
-    Enriquece lista de postos com lat/lon usando CNPJ como chave principal.
+    Enriquece postos com lat/lon SEM REMOVER nenhum.
+    'limite' controla apenas quantos recebem geolocalização
+    (os demais ficam com latitude/longitude = None, mas PERMANECEM na lista).
     """
-    if limite:
-        postos_geo = postos[:limite]
-        postos_resto = postos[limite:]
-    else:
-        postos_geo = postos
-        postos_resto = []
+    if not postos:
+        return []
 
-    for posto in postos_geo:
-        geo = geolocalizar_posto_por_cnpj(
-            cnpj=posto.get("cnpj", ""),
-            endereco_csv=posto.get("endereco", ""),
-            bairro_csv=posto.get("bairro", ""),
-            municipio_csv=posto.get("_municipio_original", ""),
-            uf_csv=posto.get("_uf_original", ""),
-        )
-        if geo:
-            posto["latitude"] = geo["latitude"]
-            posto["longitude"] = geo["longitude"]
-            posto["geo_fonte"] = geo.get("fonte_endereco", "desconhecida")
-            posto["geo_precisao"] = geo.get("nivel_precisao")
-            posto["geo_cep"] = geo.get("cep_encontrado")
+    total = len(postos)
+    n_geo = min(limite, total) if limite else total
+    print(f"📍 Geolocalização: {n_geo}/{total} postos serão geocodificados")
+
+    for i, posto in enumerate(postos):
+        if i < n_geo:
+            geo = geolocalizar_posto_por_cnpj(
+                cnpj=posto.get("cnpj", ""),
+                endereco_csv=posto.get("endereco", ""),
+                bairro_csv=posto.get("bairro", ""),
+                municipio_csv=posto.get("_municipio_original", ""),
+                uf_csv=posto.get("_uf_original", ""),
+            )
+            if geo:
+                posto["latitude"] = geo["latitude"]
+                posto["longitude"] = geo["longitude"]
+                posto["geo_fonte"] = geo.get("fonte_endereco", "desconhecida")
+                posto["geo_precisao"] = geo.get("nivel_precisao")
+                posto["geo_cep"] = geo.get("cep_encontrado")
+            else:
+                posto["latitude"] = None
+                posto["longitude"] = None
+                posto["geo_fonte"] = None
+                posto["geo_precisao"] = None
+                posto["geo_cep"] = None
         else:
             posto["latitude"] = None
             posto["longitude"] = None
@@ -284,14 +318,7 @@ def enriquecer_postos_com_geo(postos: list, limite: int = None) -> list:
             posto["geo_precisao"] = None
             posto["geo_cep"] = None
 
-    for posto in postos_resto:
-        posto["latitude"] = None
-        posto["longitude"] = None
-        posto["geo_fonte"] = None
-        posto["geo_precisao"] = None
-        posto["geo_cep"] = None
-
-    return postos_geo + postos_resto
+    return postos
 
 
 # ======================== FUNÇÕES ANP (CSV) ========================
@@ -421,7 +448,7 @@ def get_precos(
     uf: str,
     produto: str = None,
     com_geo: bool = Query(False, description="Inclui geolocalização (mais lento)"),
-    limite_geo: int = Query(30, description="Máximo de postos a geolocalizar"),
+    limite_geo: int = Query(30, description="Máximo de postos a geocodificar (os demais continuam na lista, sem lat/lon)"),
 ):
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
@@ -468,12 +495,14 @@ def get_precos(
                 if "bandeira" in cl: col_bandeira = col
 
             if not all([col_municipio, col_uf, col_produto, col_valor]):
+                print(f"⚠️ Colunas essenciais faltando em {caminho}")
                 continue
 
             df["_municipio_norm"] = df[col_municipio].astype(str).apply(normalizar_texto)
             df["_uf_norm"] = df[col_uf].astype(str).apply(normalizar_texto)
             df["_produto_norm"] = df[col_produto].astype(str).apply(normalizar_texto)
 
+            # Filtro por município e UF (exato primeiro)
             df_filtrado = df[
                 (df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)
             ]
@@ -482,6 +511,8 @@ def get_precos(
                 df_filtrado = df[
                     (df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)
                 ]
+
+            print(f"🔎 {tipo_csv} - {municipio}/{uf}: {len(df_filtrado)} linhas no CSV")
 
             if df_filtrado.empty:
                 continue
@@ -502,23 +533,24 @@ def get_precos(
                 if produto and prod_label != produto.lower():
                     continue
 
+                # ⚠️ Filtro rigoroso por produto
                 if prod_chave == "GASOLINA":
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA"]
                 elif prod_chave == "GASOLINA ADITIVADA":
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA ADITIVADA"]
+                elif prod_chave == "ETANOL":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "ETANOL"]
+                elif prod_chave == "ETANOL HIDRATADO":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains("ETANOL HIDRATADO", na=False)]
+                elif prod_chave == "DIESEL":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "DIESEL"]
                 else:
                     df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
 
                 if df_prod.empty:
                     continue
 
-                valores = pd.to_numeric(
-                    df_prod[col_valor].astype(str).str.replace(",", "."),
-                    errors="coerce"
-                ).dropna()
-
-                if valores.empty:
-                    continue
+                print(f"  → {prod_label}: {len(df_prod)} linhas brutas")
 
                 postos_lista = []
                 for _, row in df_prod.iterrows():
@@ -539,16 +571,36 @@ def get_precos(
                     }
                     postos_lista.append(posto)
 
-                if com_geo and postos_lista:
-                    postos_lista = enriquecer_postos_com_geo(postos_lista, limite=limite_geo)
+                # ✅ DEDUPLICAÇÃO NO BACKEND (um registro por CNPJ)
+                postos_unicos = deduplicar_por_cnpj(postos_lista)
 
-                if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
+                if not postos_unicos:
+                    continue
+
+                # ✅ Recalcula estatísticas com a lista deduplicada
+                precos_dedup = [
+                    p["preco"] for p in postos_unicos
+                    if isinstance(p.get("preco"), (int, float))
+                ]
+                if not precos_dedup:
+                    continue
+
+                media = round(sum(precos_dedup) / len(precos_dedup), 2)
+                minimo = round(min(precos_dedup), 2)
+                maximo = round(max(precos_dedup), 2)
+
+                # ✅ Geolocalização opcional (NÃO remove nenhum posto)
+                if com_geo and postos_unicos:
+                    postos_unicos = enriquecer_postos_com_geo(postos_unicos, limite=limite_geo)
+
+                # Mantém o resultado com mais postos (caso apareça em 2 CSVs)
+                if prod_label not in resultados or len(postos_unicos) > resultados[prod_label]["total_postos"]:
                     resultados[prod_label] = {
-                        "media": round(float(valores.mean()), 2),
-                        "minimo": round(float(valores.min()), 2),
-                        "maximo": round(float(valores.max()), 2),
-                        "total_postos": len(postos_lista),
-                        "postos": postos_lista,
+                        "media": media,
+                        "minimo": minimo,
+                        "maximo": maximo,
+                        "total_postos": len(postos_unicos),
+                        "postos": postos_unicos,
                     }
 
         if not resultados:

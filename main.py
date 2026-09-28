@@ -7,9 +7,10 @@ import pandas as pd
 import os
 import re
 import time
-import zipfile
 import glob
 import unicodedata
+import json
+import hashlib
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -22,8 +23,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ======================== CONFIGURAÇÕES ========================
 PAGINA_ANP = "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/serie-historica-de-precos-de-combustiveis"
 CSV_DATA_DIR = "data"
+CACHE_API_DIR = os.path.join(CSV_DATA_DIR, "cache_api_anp")
+os.makedirs(CSV_DATA_DIR, exist_ok=True)
+os.makedirs(CACHE_API_DIR, exist_ok=True)
+
+# ✅ API OFICIAL DA ANP — retorna TODOS os postos autorizados + lat/lon
+ANP_API_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustiveis"
+
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
 OCM_BASE_URL = "https://api.openchargemap.io/v3"
 PETROBRAS_CACHE = {}
@@ -31,8 +40,11 @@ PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
 DIAS_PARA_CONSIDERAR_ANTIGO = 30
 
+API_CACHE_TTL_HORAS = 24
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
 }
 
 PRODUTO_PALAVRAS = {
@@ -44,6 +56,7 @@ PRODUTO_PALAVRAS = {
 }
 
 
+# ======================== UTILITÁRIOS ========================
 def normalizar_texto(texto):
     if not texto:
         return ""
@@ -52,6 +65,154 @@ def normalizar_texto(texto):
     return sem_acento.upper().strip()
 
 
+def normalizar_cnpj(cnpj) -> str:
+    if not cnpj:
+        return ""
+    return re.sub(r"\D", "", str(cnpj))
+
+
+def _cache_path(municipio: str, uf: str) -> str:
+    chave = f"{normalizar_texto(municipio)}_{normalizar_texto(uf)}"
+    h = hashlib.md5(chave.encode("utf-8")).hexdigest()
+    return os.path.join(CACHE_API_DIR, f"{h}.json")
+
+
+# ======================== API OFICIAL ANP — TODOS OS POSTOS ========================
+def buscar_todos_postos_anp(municipio: str, uf: str) -> list:
+    """
+    Consulta a API oficial da ANP e retorna TODOS os postos autorizados
+    no município, com lat/lon oficiais quando disponíveis.
+    Cache de 24h por município.
+    """
+    cache_file = _cache_path(municipio, uf)
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if time.time() - cached.get("_ts", 0) < API_CACHE_TTL_HORAS * 3600:
+                postos = cached.get("postos", [])
+                print(f"📦 API ANP cache: {len(postos)} postos em {municipio}/{uf}")
+                return postos
+        except Exception:
+            pass
+
+    postos = []
+    try:
+        params = {
+            "municipio": municipio.upper().strip(),
+            "uf": uf.upper().strip(),
+        }
+        print(f"📡 API ANP: consultando {municipio}/{uf}...")
+        r = requests.get(ANP_API_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        dados = r.json()
+
+        # Estrutura: {"items": [...], "paginas": N}
+        if isinstance(dados, dict):
+            itens = dados.get("items", [])
+            total_paginas = int(dados.get("paginas", 1) or 1)
+        elif isinstance(dados, list):
+            itens = dados
+            total_paginas = 1
+        else:
+            itens = []
+            total_paginas = 1
+
+        # Acumula itens de todas as páginas
+        for item in itens:
+            posto = _extrair_posto_api(item, municipio, uf)
+            if posto:
+                postos.append(posto)
+
+        # Páginas adicionais
+        for pagina in range(2, total_paginas + 1):
+            try:
+                params["numeropagina"] = pagina
+                r = requests.get(ANP_API_REVENDEDORES, params=params, headers=HEADERS, timeout=30)
+                if r.status_code == 200:
+                    d = r.json()
+                    itens_pag = d.get("items", []) if isinstance(d, dict) else []
+                    for item in itens_pag:
+                        posto = _extrair_posto_api(item, municipio, uf)
+                        if posto:
+                            postos.append(posto)
+            except Exception as e:
+                print(f"⚠️ Erro página {pagina}: {e}")
+
+        # Deduplica por CNPJ
+        unicos = {}
+        for p in postos:
+            unicos[p["cnpj"]] = p
+        postos = list(unicos.values())
+
+        print(f"✅ API ANP: {len(postos)} postos em {municipio}/{uf}")
+
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump({"_ts": time.time(), "postos": postos}, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"⚠️ Erro salvando cache: {e}")
+
+        return postos
+
+    except Exception as e:
+        print(f"❌ Erro API ANP: {e}")
+        # Tenta cache expirado
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                return cached.get("postos", [])
+            except Exception:
+                pass
+        return []
+
+
+def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
+    """Extrai campos relevantes de um item da API ANP."""
+    if not isinstance(item, dict):
+        return None
+
+    cnpj = normalizar_cnpj(item.get("cnpj") or item.get("CNPJ") or "")
+    if not cnpj:
+        return None
+
+    # Coordenadas: ANP4C é mais precisa, mas nem sempre vem
+    lat = item.get("latitude") or item.get("Latitude")
+    lon = item.get("longitude") or item.get("Longitude")
+    lat4 = item.get("latitude_anp4c") or item.get("Latitude (ANP4C)")
+    lon4 = item.get("longitude_anp4c") or item.get("Longitude (ANP4C)")
+
+    lat_f = lon_f = None
+    for lt, ln in [(lat4, lon4), (lat, lon)]:
+        if lt and ln:
+            try:
+                a = float(str(lt).replace(",", "."))
+                b = float(str(ln).replace(",", "."))
+                if -90 <= a <= 90 and -180 <= b <= 180 and (a != 0 or b != 0):
+                    lat_f, lon_f = a, b
+                    break
+            except (ValueError, TypeError):
+                continue
+
+    return {
+        "cnpj": cnpj,
+        "revenda": item.get("razao_social") or item.get("Razão Social") or "",
+        "nome_fantasia": item.get("nome_fantasia") or item.get("Nome Fantasia") or "",
+        "endereco": item.get("endereco") or item.get("Endereço") or "",
+        "numero": item.get("numero") or item.get("Número") or "",
+        "bairro": item.get("bairro") or item.get("Bairro") or "",
+        "municipio": item.get("municipio") or item.get("Município") or municipio,
+        "uf": item.get("uf") or item.get("UF") or uf,
+        "cep": item.get("cep") or item.get("CEP") or "",
+        "distribuidora": item.get("distribuidora") or item.get("Distribuidora") or "",
+        "bandeira": item.get("bandeira") or item.get("Bandeira") or "",
+        "latitude": lat_f,
+        "longitude": lon_f,
+    }
+
+
+# ======================== FUNÇÕES ANP (CSV DE PREÇOS) ========================
 def gerar_nome_csv(produto="gasolina"):
     agora = datetime.now()
     data_str = agora.strftime("%d%m%Y_%H%M")
@@ -83,9 +244,7 @@ def listar_csvs_antigos(dias=DIAS_PARA_CONSIDERAR_ANTIGO):
         nome = os.path.basename(caminho)
         partes = nome.replace("precos_anp_", "").replace(".csv", "").split("_")
         produto = partes[0] if partes else "desconhecido"
-        if produto not in por_produto:
-            por_produto[produto] = []
-        por_produto[produto].append(caminho)
+        por_produto.setdefault(produto, []).append(caminho)
     for produto, lista in por_produto.items():
         lista.sort(key=os.path.getmtime, reverse=True)
         for caminho in lista[1:]:
@@ -172,16 +331,30 @@ def baixar_csv(tipo: str = "gasolina"):
         return {"erro": str(e)}
 
 
+# ======================== ENDPOINT PRINCIPAL ========================
 @app.get("/api/precos")
-def get_precos(municipio: str, uf: str, produto: str = None):
+def get_precos(
+    municipio: str,
+    uf: str,
+    produto: str = None,
+    incluir_sem_preco: bool = Query(True, description="Inclui postos sem preço"),
+):
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
 
-    # ⚠️ ALTERAÇÃO AQUI: adicionar GLP à lista de CSVs
+    print(f"\n{'='*60}")
+    print(f"🔍 {municipio}/{uf} - produto: {produto or 'todos'}")
+    print(f"{'='*60}")
+
+    # PASSO 1: Busca TODOS os postos na API oficial da ANP
+    postos_api = buscar_todos_postos_anp(municipio, uf)
+    print(f"📋 Base ANP: {len(postos_api)} postos autorizados")
+
+    # PASSO 2: Baixa/recupera CSVs de preços
     csvs_disponiveis = {
         "gasolina": obter_csv_mais_recente("gasolina"),
         "diesel": obter_csv_mais_recente("diesel"),
-        "glp": obter_csv_mais_recente("glp"),   # ← NOVO
+        "glp": obter_csv_mais_recente("glp"),
     }
 
     for tipo, caminho in csvs_disponiveis.items():
@@ -229,7 +402,6 @@ def get_precos(municipio: str, uf: str, produto: str = None):
             df_filtrado = df[
                 (df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)
             ]
-
             if df_filtrado.empty:
                 df_filtrado = df[
                     (df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)
@@ -258,56 +430,131 @@ def get_precos(municipio: str, uf: str, produto: str = None):
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA"]
                 elif prod_chave == "GASOLINA ADITIVADA":
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA ADITIVADA"]
+                elif prod_chave == "ETANOL":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "ETANOL"]
+                elif prod_chave == "ETANOL HIDRATADO":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains("ETANOL HIDRATADO", na=False)]
+                elif prod_chave == "DIESEL":
+                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "DIESEL"]
                 else:
                     df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
 
                 if df_prod.empty:
                     continue
 
-                valores = pd.to_numeric(
-                    df_prod[col_valor].astype(str).str.replace(",", "."),
-                    errors="coerce"
-                ).dropna()
-
-                if valores.empty:
-                    continue
-
-                postos_lista = []
+                # Mapa CNPJ → preço (último preço encontrado = mais recente)
+                mapa_precos = {}
                 for _, row in df_prod.iterrows():
                     try:
                         preco = float(str(row[col_valor]).replace(",", "."))
                     except (ValueError, TypeError):
                         continue
-                    postos_lista.append({
-                        "revenda": str(row[col_revenda]) if col_revenda else "",
-                        "cnpj": str(row[col_cnpj]) if col_cnpj else "",
-                        "endereco": f"{row[col_endereco]}" if col_endereco else "",
-                        "bairro": str(row[col_bairro]) if col_bairro else "",
-                        "bandeira": str(row[col_bandeira]) if col_bandeira else "",
-                        "produto": str(row[col_produto]) if col_produto else "",
+                    cnpj = normalizar_cnpj(row[col_cnpj]) if col_cnpj else ""
+                    if not cnpj:
+                        continue
+                    mapa_precos[cnpj] = {
                         "preco": round(preco, 2),
-                    })
+                        "bandeira_csv": str(row[col_bandeira]) if col_bandeira else "",
+                    }
+
+                # ============================================================
+                # MERGE: base ANP (todos) + preços do CSV
+                # ============================================================
+                postos_merge = {}
+
+                # 1. Todos os postos da base ANP
+                for p in postos_api:
+                    postos_merge[p["cnpj"]] = {
+                        **p,
+                        "preco": None,
+                        "tem_preco": False,
+                        "produto": prod_label.upper(),
+                    }
+
+                # 2. Sobrepõe com preços
+                for cnpj, dados_preco in mapa_precos.items():
+                    if cnpj in postos_merge:
+                        postos_merge[cnpj]["preco"] = dados_preco["preco"]
+                        postos_merge[cnpj]["tem_preco"] = True
+                        if dados_preco["bandeira_csv"]:
+                            postos_merge[cnpj]["bandeira"] = dados_preco["bandeira_csv"]
+                    else:
+                        # Posto com preço fora da base ANP (improvável, mas garante)
+                        postos_merge[cnpj] = {
+                            "cnpj": cnpj,
+                            "revenda": f"Posto {cnpj}",
+                            "endereco": "",
+                            "bairro": "",
+                            "bandeira": dados_preco["bandeira_csv"],
+                            "municipio": municipio,
+                            "uf": uf,
+                            "preco": dados_preco["preco"],
+                            "tem_preco": True,
+                            "produto": prod_label.upper(),
+                            "latitude": None,
+                            "longitude": None,
+                        }
+
+                postos_lista = list(postos_merge.values())
+
+                # Estatísticas só com preço
+                precos_validos = [p["preco"] for p in postos_lista if isinstance(p.get("preco"), (int, float))]
+                if not precos_validos:
+                    continue
+
+                media = round(sum(precos_validos) / len(precos_validos), 2)
+                minimo = round(min(precos_validos), 2)
+                maximo = round(max(precos_validos), 2)
+
+                # Ordenação: com preço (menor→maior) → sem preço (alfabético)
+                postos_lista.sort(key=lambda p: (
+                    0 if isinstance(p.get("preco"), (int, float)) else 1,
+                    p.get("preco") if isinstance(p.get("preco"), (int, float)) else 9999,
+                    normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or ""),
+                ))
+
+                com_preco = sum(1 for p in postos_lista if isinstance(p.get("preco"), (int, float)))
+                sem_preco = len(postos_lista) - com_preco
+
+                print(f"  ✅ {prod_label}: {len(postos_lista)} postos ({com_preco} c/ preço, {sem_preco} s/ preço)")
 
                 if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
                     resultados[prod_label] = {
-                        "media": round(float(valores.mean()), 2),
-                        "minimo": round(float(valores.min()), 2),
-                        "maximo": round(float(valores.max()), 2),
+                        "media": media,
+                        "minimo": minimo,
+                        "maximo": maximo,
                         "total_postos": len(postos_lista),
+                        "total_com_preco": com_preco,
+                        "total_sem_preco": sem_preco,
                         "postos": postos_lista,
                     }
 
         if not resultados:
-            return {"erro": "Nenhum preço encontrado", "municipio": municipio, "uf": uf, "produtos": {}}
+            return {
+                "erro": "Nenhum preço encontrado",
+                "municipio": municipio,
+                "uf": uf,
+                "produtos": {},
+                "fonte_api_anp": len(postos_api),
+            }
 
-        return {"municipio": municipio, "uf": uf, "produtos": resultados}
+        return {
+            "municipio": municipio,
+            "uf": uf,
+            "fonte_api_anp": len(postos_api),
+            "produtos": resultados,
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Erro: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ======================== DEMAIS ENDPOINTS ========================
 @app.get("/api/csvs-baixados")
 def listar_csvs_baixados():
     if not os.path.exists(CSV_DATA_DIR):
@@ -381,6 +628,7 @@ def atualizar_agora():
     return {"status": "ok", "mensagem": "Verificação concluída."}
 
 
+# ======================== COMPOSIÇÃO PETROBRAS ========================
 def raspar_composicao_petrobras(produto="gasolina"):
     agora = time.time()
     if produto in PETROBRAS_CACHE:
@@ -392,7 +640,7 @@ def raspar_composicao_petrobras(produto="gasolina"):
         "gasolina": "https://precos.petrobras.com.br/precos-gasolina",
         "diesel": "https://precos.petrobras.com.br/precos-diesel",
         "glp": "https://precos.petrobras.com.br/precos-glp",
-        "gnv": "https://precos.petrobras.com.br/precos-gnv", 
+        "gnv": "https://precos.petrobras.com.br/precos-gnv",
     }
     url = urls.get(produto.lower())
     if not url:
@@ -461,7 +709,6 @@ def raspar_composicao_petrobras(produto="gasolina"):
 def get_composicao(uf: str = "BR", produto: str = "gasolina"):
     dados = raspar_composicao_petrobras(produto)
     if not dados:
-        # Fallback estático para cada produto
         fallback = {
             "gasolina": {
                 "parcela_petrobras": 2.08, "impostos_federais": 0.24,
@@ -476,14 +723,12 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
                 "periodo": "Fallback estático",
             },
             "gnv": {
-                # GNV vendido em m³ — composição baseada em gás natural
                 "parcela_petrobras": 2.40, "impostos_federais": 0.18,
                 "icms": 1.20, "biocombustivel": 0.00,
                 "margem_distribuicao_revenda": 0.90, "preco_medio_final": 4.68,
                 "periodo": "Fallback estático",
             },
             "glp": {
-                # GLP P13 (botijão 13kg) — composição baseada em propano/butano
                 "parcela_petrobras": 45.00, "impostos_federais": 3.50,
                 "icms": 12.00, "biocombustivel": 0.00,
                 "margem_distribuicao_revenda": 22.00, "preco_medio_final": 82.50,
@@ -507,12 +752,14 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
 
     return {"uf": uf, "produto": produto, **dados}
 
+
+# ======================== ELETROPOSTOS ========================
 @app.get("/api/eletropostos")
 def get_eletropostos(
     latitude: float = Query(...),
     longitude: float = Query(...),
-    raio_km: float = Query(10),
-    max_resultados: int = Query(50),
+    raio_km: float = Query(25),
+    max_resultados: int = Query(100),
 ):
     if not OCM_API_KEY or OCM_API_KEY == "SUA_CHAVE_AQUI":
         raise HTTPException(status_code=500, detail="Configure a OCM_API_KEY.")
@@ -583,6 +830,7 @@ def get_eletropostos(
         raise HTTPException(status_code=502, detail=f"Erro ao consultar OCM: {str(e)}")
 
 
+# ======================== AGENDADOR ========================
 def verificar_e_baixar_novos_csvs():
     print(f"\n🔍 [AGENDADOR] Verificando...")
     for produto in PRODUTO_PALAVRAS.keys():

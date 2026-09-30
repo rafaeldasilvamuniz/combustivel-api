@@ -29,11 +29,19 @@ CSV_DATA_DIR = "data"
 CACHE_API_DIR = os.path.join(CSV_DATA_DIR, "cache_api_anp")
 CACHE_CEP_DIR = os.path.join(CSV_DATA_DIR, "cache_cep")
 CACHE_PETROBRAS_DIR = os.path.join(CSV_DATA_DIR, "cache_petrobras")
+CACHE_ELETRO_DIR = os.path.join(CSV_DATA_DIR, "cache_eletropostos")
 
 # ⚠️ IMPORTANTE: gere uma nova chave em https://openchargemap.org/site/develop/api
-# A chave abaixo foi exposta em conversa anterior e pode estar inválida.
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
 OCM_BASE_URL = "https://api.openchargemap.io/v3"
+
+# ✅ Configurações de busca de eletropostos
+ELETRO_RAIO_CIDADE_KM = 25        # raio inicial para achar a própria cidade
+ELETRO_RAIO_VIZINHAS_KM = 75      # raio estendido para cidades vizinhas
+ELETRO_RAIO_EMERGENCIA_KM = 150   # raio de emergência (último recurso)
+ELETRO_MAX_RESULTADOS = 500       # máximo por chamada OCM
+ELETRO_CACHE_TTL_HORAS = 24       # eletropostos mudam pouco
+
 PETROBRAS_CACHE = {}
 PETROBRAS_CACHE_TTL = 3600
 INTERVALO_VERIFICACAO_HORAS = 6
@@ -84,6 +92,7 @@ os.makedirs(CSV_DATA_DIR, exist_ok=True)
 os.makedirs(CACHE_API_DIR, exist_ok=True)
 os.makedirs(CACHE_CEP_DIR, exist_ok=True)
 os.makedirs(CACHE_PETROBRAS_DIR, exist_ok=True)
+os.makedirs(CACHE_ELETRO_DIR, exist_ok=True)
 
 HEADERS_NAVEGADOR = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -147,6 +156,11 @@ def _petrobras_cache_path(produto: str, uf: str) -> str:
     h = hashlib.md5(chave.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_PETROBRAS_DIR, f"{h}.json")
 
+def _eletro_cache_path(lat: float, lon: float, raio_km: float) -> str:
+    chave = f"{lat:.4f}_{lon:.4f}_{raio_km:.0f}"
+    h = hashlib.md5(chave.encode("utf-8")).hexdigest()
+    return os.path.join(CACHE_ELETRO_DIR, f"{h}.json")
+
 def _ler_petrobras_cache_disco(produto: str, uf: str):
     caminho = _petrobras_cache_path(produto, uf)
     if not os.path.exists(caminho):
@@ -183,6 +197,19 @@ def validar_preco(produto_label: str, preco: float):
         return True
     minimo, maximo = faixa
     return minimo <= preco <= maximo
+
+def calcular_distancia_km(lat1, lon1, lat2, lon2):
+    """Fórmula de Haversine — distância entre dois pontos em km."""
+    try:
+        from math import radians, sin, cos, sqrt, atan2
+        R = 6371.0
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1-a))
+        return round(R * c, 2)
+    except Exception:
+        return None
 
 # ======================== GEOCÓDIGO POR CEP ========================
 def geocodificar_por_cep(cep: str) -> dict:
@@ -433,10 +460,6 @@ def apagar_csv(caminho):
 
 # ======================== DESCOBERTA DINÂMICA DE URLs DA ANP ========================
 def descobrir_urls_csv_anp():
-    """
-    ✅ Raspa a página da ANP e extrai os links .csv da seção 'Quatro últimas semanas'.
-    Retorna dict: {"gasolina-etanol": "url", "diesel-gnv": "url", "glp": "url"}
-    """
     urls_encontradas = {}
     try:
         print(f"🌐 [ANP] raspando página para descobrir URLs dos CSVs...")
@@ -444,7 +467,6 @@ def descobrir_urls_csv_anp():
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "html.parser")
 
-        # Estratégia 1: procurar por todos os <a href="...csv"> que contenham "ultimas-4-semanas" ou "/qus/"
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href.lower().endswith(".csv"):
@@ -453,13 +475,11 @@ def descobrir_urls_csv_anp():
             if "ultimas-4-semanas" not in href_lower and "/qus/" not in href_lower:
                 continue
 
-            # Normaliza URL relativa
             if href.startswith("/"):
                 href = "https://www.gov.br" + href
             elif not href.startswith("http"):
                 href = "https://www.gov.br/anp/" + href.lstrip("/")
 
-            # Classifica por nome
             if "gasolina" in href_lower or "etanol" in href_lower:
                 urls_encontradas.setdefault("gasolina-etanol", href)
             elif "diesel" in href_lower:
@@ -469,7 +489,6 @@ def descobrir_urls_csv_anp():
             elif "gnv" in href_lower:
                 urls_encontradas.setdefault("diesel-gnv", href)
 
-        # Estratégia 2: se não achou nada, procurar por qualquer .csv que contenha "4-semanas" ou "semanas"
         if not urls_encontradas:
             for a in soup.find_all("a", href=True):
                 href = a["href"]
@@ -492,20 +511,16 @@ def descobrir_urls_csv_anp():
 
         if urls_encontradas:
             print(f"✅ [ANP] descobertos {len(urls_encontradas)} links via scraping")
-            for k, v in urls_encontradas.items():
-                print(f"   • {k}: {v}")
         else:
             print(f"⚠️ [ANP] nenhum link .csv encontrado na página")
 
         return urls_encontradas
-
     except Exception as e:
         print(f"❌ [ANP] erro raspando página: {e}")
         return {}
 
 
 def _mapear_produto_para_grupo(produto: str):
-    """Mapeia produto → grupo de CSV da ANP."""
     p = produto.lower()
     if p in ("gasolina", "etanol", "gasolina_aditivada"):
         return "gasolina-etanol"
@@ -517,21 +532,13 @@ def _mapear_produto_para_grupo(produto: str):
 
 
 def obter_url_csv(produto: str) -> str:
-    """
-    ✅ Retorna a URL do CSV para o produto, tentando em 3 camadas:
-    1. Descoberta dinâmica (raspagem da página ANP)
-    2. URLs hard-coded (fallback)
-    3. Cache local do último link que funcionou
-    """
     produto_lower = produto.lower()
     cache_link_file = os.path.join(CACHE_API_DIR, "ultimo_link_anp.json")
     grupo = _mapear_produto_para_grupo(produto_lower)
 
-    # ── Camada 1 — Descoberta dinâmica ──
     urls_descobertas = descobrir_urls_csv_anp()
     if urls_descobertas and grupo and grupo in urls_descobertas:
         url = urls_descobertas[grupo]
-        # Salva no cache local
         try:
             cache_atual = {}
             if os.path.exists(cache_link_file):
@@ -544,12 +551,10 @@ def obter_url_csv(produto: str) -> str:
             pass
         return url
 
-    # ── Camada 2 — URLs hard-coded ──
     if produto_lower in CSV_URLS_ANP and CSV_URLS_ANP[produto_lower]:
         print(f"ℹ️ [ANP] usando URL hard-coded para {produto_lower}")
         return CSV_URLS_ANP[produto_lower][0]
 
-    # ── Camada 3 — Cache do último link que funcionou ──
     if os.path.exists(cache_link_file):
         try:
             with open(cache_link_file, "r", encoding="utf-8") as f:
@@ -565,14 +570,10 @@ def obter_url_csv(produto: str) -> str:
 
 
 def encontrar_link_csv_anp(produto="gasolina"):
-    """
-    ✅ Testa a URL obtida (dinâmica → hard-coded → cache) e retorna a primeira válida.
-    """
     url = obter_url_csv(produto)
     if not url:
         return None
 
-    # Testa se a URL responde como CSV
     try:
         print(f"🔗 [CSV] testando URL: {url}")
         r = _sessao.get(url, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
@@ -593,7 +594,6 @@ def encontrar_link_csv_anp(produto="gasolina"):
     except Exception as e:
         print(f"⚠️ [CSV] erro testando {url}: {e}")
 
-    # Se a URL primária falhou, tenta as hard-coded (fallback)
     for url_alt in CSV_URLS_ANP.get(produto.lower(), []):
         if url_alt == url:
             continue
@@ -678,7 +678,6 @@ def testar_csvs():
 
 @app.get("/api/descobrir-links-anp")
 def descobrir_links_anp():
-    """✅ Endpoint de diagnóstico: mostra o que a raspagem da página ANP encontrou."""
     urls = descobrir_urls_csv_anp()
     return {
         "total": len(urls),
@@ -695,7 +694,6 @@ def baixar_csv(tipo: str = "gasolina"):
 
         csv_url = encontrar_link_csv_anp(tipo)
 
-        # ⚠️ Se nenhuma URL funcionou, verifica se já temos CSV local
         if not csv_url:
             csv_local = obter_csv_mais_recente(tipo)
             if csv_local:
@@ -764,7 +762,7 @@ def garantir_todos_csvs(force_rebaixar_antigos=True):
             resultado = baixar_csv(tipo=produto)
             status_por_produto[produto] = {
                 "acao": "baixado",
-                "ok": resultado.get("status") == "ok" or resultado.get("status") == "ok_offline",
+                "ok": resultado.get("status") in ("ok", "ok_offline"),
                 "arquivo": resultado.get("arquivo"),
                 "erro": resultado.get("erro"),
             }
@@ -844,14 +842,12 @@ def get_precos(
     print(f"🔍 {municipio}/{uf} - produto: {produto or 'todos'}")
     print(f"{'='*60}")
 
-    # ✅ PASSO 1 — Cadastro ANP
     postos_api = buscar_postos_anp_api(municipio, uf)
     print(f"📋 Base ANP: {len(postos_api)} postos autorizados em {municipio}/{uf}")
 
     if geocodificar_cep and postos_api:
         postos_api = enriquecer_postos_sem_coordenada(postos_api, limite=40)
 
-    # ✅ PASSO 2 — Garantir TODOS os CSVs (5 produtos)
     garantir_todos_csvs(force_rebaixar_antigos=True)
 
     csvs_disponiveis = {p: obter_csv_mais_recente(p) for p in PRODUTOS}
@@ -1383,13 +1379,91 @@ def petrobras_cache_limpar():
     return {"status": "ok", "total_apagados": apagados}
 
 # ======================== ELETROPOSTOS ========================
+def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results: int = 500):
+    """✅ Faz a chamada à OCM e retorna a lista crua (ou [] em caso de erro)."""
+    try:
+        params = {
+            "key": OCM_API_KEY, "output": "json",
+            "latitude": lat, "longitude": lon,
+            "distance": raio_km, "distanceunit": "KM",
+            "maxresults": max_results, "compact": True, "verbose": True,
+        }
+        r = _sessao.get(f"{OCM_BASE_URL}/poi/", params=params, timeout=45)
+        if r.status_code != 200:
+            print(f"⚠️ [OCM] status {r.status_code}: {r.text[:150]}")
+            return []
+        try:
+            return r.json()
+        except ValueError:
+            print(f"⚠️ [OCM] resposta não-JSON: {r.text[:150]}")
+            return []
+    except Exception as e:
+        print(f"⚠️ [OCM] erro de rede: {e}")
+        return []
+
+
+def _formatar_eletroposto(item: dict, lat_origem: float = None, lon_origem: float = None) -> dict:
+    """✅ Converte um item cru da OCM no formato que o app espera."""
+    endereco = item.get("AddressInfo") or {}
+    conexoes = item.get("Connections") or []
+    conexoes_formatadas = []
+    custo_estimado_total = 0
+    potencia_total = 0
+
+    for c in conexoes[:5]:
+        pot = c.get("PowerKW") or 0
+        potencia_total += pot
+        preco_estimado_kwh = 2.50 if pot >= 22 else 1.50
+        custo_sessao = round(preco_estimado_kwh * 30, 2)
+        custo_estimado_total += custo_sessao
+        conexoes_formatadas.append({
+            "tipo": (c.get("ConnectionType") or {}).get("Title") if c.get("ConnectionType") else "N/A",
+            "potencia_kw": pot,
+            "quantidade": c.get("Quantity", 1),
+            "preco_estimado_kwh": preco_estimado_kwh,
+            "custo_estimado_30kwh": custo_sessao,
+        })
+
+    lat = endereco.get("Latitude")
+    lon = endereco.get("Longitude")
+    distancia = None
+    if lat is not None and lon is not None and lat_origem is not None and lon_origem is not None:
+        distancia = calcular_distancia_km(lat_origem, lon_origem, lat, lon)
+
+    return {
+        "id": item.get("ID"),
+        "nome": endereco.get("Title"),
+        "endereco": endereco.get("AddressLine1"),
+        "cidade": endereco.get("Town"),
+        "uf": endereco.get("StateOrProvince"),
+        "latitude": lat,
+        "longitude": lon,
+        "distancia_km": distancia,
+        "operador": (item.get("OperatorInfo") or {}).get("Title") if item.get("OperatorInfo") else "Não informado",
+        "conexoes": conexoes_formatadas,
+        "potencia_total_kw": potencia_total,
+        "custo_estimado_sessao": round(custo_estimado_total, 2) if conexoes_formatadas else 0,
+        "observacao_custo": "Estimativa baseada em tarifas médias: R$1,50/kWh (AC) e R$2,50/kWh (DC), sessão média de 30 kWh",
+        "status": (item.get("StatusType") or {}).get("Title") if item.get("StatusType") else "Disponível",
+    }
+
+
 @app.get("/api/eletropostos")
 def get_eletropostos(
-    latitude: float = Query(None),
-    longitude: float = Query(None),
-    raio_km: float = Query(25),
-    max_resultados: int = Query(100),
+    latitude: float = Query(None, description="Latitude do centro da busca"),
+    longitude: float = Query(None, description="Longitude do centro da busca"),
+    municipio: str = Query(None, description="Nome do município (opcional, melhora o filtro)"),
+    uf: str = Query(None, description="UF (opcional)"),
+    raio_km: float = Query(ELETRO_RAIO_CIDADE_KM, description="Raio inicial em km"),
+    max_resultados: int = Query(ELETRO_MAX_RESULTADOS),
 ):
+    """
+    ✅ Busca eletropostos com 3 camadas:
+    1. Tenta achar TODOS os eletropostos da cidade (filtro por Town + raio inicial).
+    2. Se não achar nenhum, expande o raio para ELETRO_RAIO_VIZINHAS_KM
+       e retorna os mais próximos das cidades vizinhas.
+    3. Se ainda não achar, usa ELETRO_RAIO_EMERGENCIA_KM (último recurso).
+    """
     if latitude is None or longitude is None:
         raise HTTPException(
             status_code=400,
@@ -1399,68 +1473,109 @@ def get_eletropostos(
     if not OCM_API_KEY or OCM_API_KEY == "SUA_CHAVE_AQUI":
         raise HTTPException(status_code=500, detail="Configure a OCM_API_KEY.")
 
-    try:
-        params = {
-            "key": OCM_API_KEY, "output": "json",
-            "latitude": latitude, "longitude": longitude,
-            "distance": raio_km, "distanceunit": "KM",
-            "maxresults": max_resultados, "compact": True, "verbose": True,
+    municipio_norm = normalizar_texto(municipio) if municipio else None
+
+    # ═══════ Camada 1: cidade (raio inicial, filtro por Town) ═══════
+    print(f"\n⚡ [Eletropostos] camada 1: raio {raio_km} km em ({latitude}, {longitude})")
+    itens = _buscar_eletropostos_ocm(latitude, longitude, raio_km, max_resultados)
+
+    if municipio_norm:
+        itens_cidade = [
+            i for i in itens
+            if normalizar_texto((i.get("AddressInfo") or {}).get("Town") or "") == municipio_norm
+        ]
+    else:
+        itens_cidade = itens
+
+    # Se achou na cidade, já formata e retorna
+    if itens_cidade:
+        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_cidade]
+        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
+        print(f"✅ [Eletropostos] camada 1: {len(formatados)} eletropostos em {municipio or 'região'}")
+        return {
+            "total": len(formatados),
+            "modo_busca": "cidade",
+            "raio_usado_km": raio_km,
+            "municipio_filtrado": municipio,
+            "mensagem": f"{len(formatados)} eletropostos encontrados em {municipio or 'sua região'}",
+            "eletropostos": formatados,
         }
-        r = _sessao.get(f"{OCM_BASE_URL}/poi/", params=params, timeout=30)
 
-        if r.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"OpenChargeMap retornou status {r.status_code}. "
-                       f"Verifique se a chave OCM_API_KEY é válida. "
-                       f"Resposta: {r.text[:200]}"
-            )
+    # ═══════ Camada 2: cidades vizinhas (raio maior, sem filtro) ═══════
+    print(f"⚠️ [Eletropostos] camada 1 vazia. Expandindo para {ELETRO_RAIO_VIZINHAS_KM} km...")
+    itens_vizinhos = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_VIZINHAS_KM, max_resultados)
 
+    if itens_vizinhos:
+        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_vizinhos]
+        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
+        cidades_vizinhas = sorted(set(
+            (e.get("cidade") or "Desconhecida")
+            for e in formatados[:20]
+        ))
+        print(f"✅ [Eletropostos] camada 2: {len(formatados)} eletropostos em cidades vizinhas")
+        return {
+            "total": len(formatados),
+            "modo_busca": "vizinhas",
+            "raio_usado_km": ELETRO_RAIO_VIZINHAS_KM,
+            "municipio_filtrado": municipio,
+            "cidades_encontradas": cidades_vizinhas,
+            "mensagem": f"Nenhum eletroposto em {municipio or 'sua cidade'}. "
+                        f"Mostrando os mais próximos em {', '.join(cidades_vizinhas[:3])}",
+            "eletropostos": formatados,
+        }
+
+    # ═══════ Camada 3: emergência (raio muito maior) ═══════
+    print(f"⚠️ [Eletropostos] camada 2 vazia. Expandindo para {ELETRO_RAIO_EMERGENCIA_KM} km...")
+    itens_emerg = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_EMERGENCIA_KM, max_resultados)
+
+    if itens_emerg:
+        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_emerg]
+        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
+        print(f"✅ [Eletropostos] camada 3: {len(formatados)} eletropostos em raio de emergência")
+        return {
+            "total": len(formatados),
+            "modo_busca": "emergencia",
+            "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
+            "municipio_filtrado": municipio,
+            "mensagem": f"Poucos eletropostos na região. Mostrando os mais próximos num raio de {ELETRO_RAIO_EMERGENCIA_KM} km",
+            "eletropostos": formatados,
+        }
+
+    # ═══════ Nada encontrado ═══════
+    print(f"❌ [Eletropostos] nenhum eletroposto num raio de {ELETRO_RAIO_EMERGENCIA_KM} km")
+    return {
+        "total": 0,
+        "modo_busca": "vazio",
+        "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
+        "municipio_filtrado": municipio,
+        "mensagem": f"Nenhum eletroposto num raio de {ELETRO_RAIO_EMERGENCIA_KM} km",
+        "eletropostos": [],
+    }
+
+
+@app.get("/api/eletropostos-cache-info")
+def eletropostos_cache_info():
+    """✅ Mostra quantos caches de eletropostos existem em disco."""
+    if not os.path.exists(CACHE_ELETRO_DIR):
+        return {"total": 0, "arquivos": []}
+    arquivos = glob.glob(os.path.join(CACHE_ELETRO_DIR, "*.json"))
+    itens = []
+    for c in arquivos:
         try:
-            dados = r.json()
-        except ValueError:
-            raise HTTPException(
-                status_code=502,
-                detail=f"OpenChargeMap retornou resposta não-JSON. "
-                       f"Provavelmente a chave está inválida. "
-                       f"Primeiros 200 chars: {r.text[:200]}"
-            )
-
-        eletropostos = []
-        for item in dados:
-            endereco = item.get("AddressInfo", {})
-            conexoes = item.get("Connections", [])
-            conexoes_formatadas = []
-            custo_estimado_total = 0
-            potencia_total = 0
-            for c in conexoes[:5]:
-                pot = c.get("PowerKW") or 0
-                potencia_total += pot
-                preco_estimado_kwh = 2.50 if pot >= 22 else 1.50
-                custo_sessao = round(preco_estimado_kwh * 30, 2)
-                custo_estimado_total += custo_sessao
-                conexoes_formatadas.append({
-                    "tipo": c.get("ConnectionType", {}).get("Title") if c.get("ConnectionType") else "N/A",
-                    "potencia_kw": pot, "quantidade": c.get("Quantity", 1),
-                    "preco_estimado_kwh": preco_estimado_kwh,
-                    "custo_estimado_30kwh": custo_sessao,
-                })
-            eletropostos.append({
-                "id": item.get("ID"), "nome": endereco.get("Title"),
-                "endereco": endereco.get("AddressLine1"), "cidade": endereco.get("Town"),
-                "uf": endereco.get("StateOrProvince"),
-                "latitude": endereco.get("Latitude"), "longitude": endereco.get("Longitude"),
-                "operador": item.get("OperatorInfo", {}).get("Title") if item.get("OperatorInfo") else "Não informado",
-                "conexoes": conexoes_formatadas, "potencia_total_kw": potencia_total,
-                "custo_estimado_sessao": round(custo_estimado_total, 2) if conexoes_formatadas else 0,
-                "observacao_custo": "Estimativa baseada em tarifas médias: R$1,50/kWh (AC) e R$2,50/kWh (DC), sessão média de 30 kWh",
-                "status": item.get("StatusType", {}).get("Title") if item.get("StatusType") else "Disponível",
+            with open(c, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            idade = time.time() - cached.get("_ts", 0)
+            itens.append({
+                "arquivo": os.path.basename(c),
+                "raio_km": cached.get("raio_km"),
+                "total_resultados": cached.get("total_resultados"),
+                "idade_segundos": round(idade),
+                "valido": idade < ELETRO_CACHE_TTL_HORAS * 3600,
             })
-        return {"total": len(eletropostos), "eletropostos": eletropostos}
-    except HTTPException:
-        raise
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Erro de rede ao consultar OCM: {str(e)}")
+        except Exception:
+            pass
+    itens.sort(key=lambda x: x["idade_segundos"])
+    return {"total": len(itens), "ttl_horas": ELETRO_CACHE_TTL_HORAS, "arquivos": itens}
 
 # ======================== AGENDADOR ========================
 def verificar_e_baixar_novos_csvs():

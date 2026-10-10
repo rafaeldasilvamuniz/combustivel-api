@@ -31,16 +31,14 @@ CACHE_CEP_DIR = os.path.join(CSV_DATA_DIR, "cache_cep")
 CACHE_PETROBRAS_DIR = os.path.join(CSV_DATA_DIR, "cache_petrobras")
 CACHE_ELETRO_DIR = os.path.join(CSV_DATA_DIR, "cache_eletropostos")
 
-# ⚠️ IMPORTANTE: gere uma nova chave em https://openchargemap.org/site/develop/api
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
 OCM_BASE_URL = "https://api.openchargemap.io/v3"
 
-# ✅ Configurações de busca de eletropostos
-ELETRO_RAIO_CIDADE_KM = 25        # raio inicial para achar a própria cidade
-ELETRO_RAIO_VIZINHAS_KM = 75      # raio estendido para cidades vizinhas
-ELETRO_RAIO_EMERGENCIA_KM = 150   # raio de emergência (último recurso)
-ELETRO_MAX_RESULTADOS = 500       # máximo por chamada OCM
-ELETRO_CACHE_TTL_HORAS = 24       # eletropostos mudam pouco
+ELETRO_RAIO_CIDADE_KM = 25
+ELETRO_RAIO_VIZINHAS_KM = 75
+ELETRO_RAIO_EMERGENCIA_KM = 150
+ELETRO_MAX_RESULTADOS = 500
+ELETRO_CACHE_TTL_HORAS = 24
 
 PETROBRAS_CACHE = {}
 PETROBRAS_CACHE_TTL = 3600
@@ -54,10 +52,8 @@ API_CACHE_TTL_HORAS = 24
 BRASILAPI_CEP_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
 CEP_CACHE_TTL_DIAS = 90
 
-# ✅ Todos os 5 produtos
 PRODUTOS = ["gasolina", "etanol", "diesel", "gnv", "glp"]
 
-# ✅ Faixas plausíveis de preço
 FAIXAS_PRECO = {
     "gasolina":           (2.50, 15.00),
     "gasolina_aditivada": (2.50, 16.00),
@@ -69,23 +65,12 @@ FAIXAS_PRECO = {
     "glp":               (30.00, 200.00),
 }
 
-# ✅ URLs de fallback (caso a descoberta dinâmica falhe)
 CSV_URLS_ANP = {
-    "gasolina": [
-        "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-gasolina-etanol.csv",
-    ],
-    "etanol": [
-        "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-gasolina-etanol.csv",
-    ],
-    "diesel": [
-        "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-diesel-gnv.csv",
-    ],
-    "gnv": [
-        "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-diesel-gnv.csv",
-    ],
-    "glp": [
-        "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-glp.csv",
-    ],
+    "gasolina": ["https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-gasolina-etanol.csv"],
+    "etanol":   ["https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-gasolina-etanol.csv"],
+    "diesel":   ["https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-diesel-gnv.csv"],
+    "gnv":      ["https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-diesel-gnv.csv"],
+    "glp":      ["https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-glp.csv"],
 }
 
 os.makedirs(CSV_DATA_DIR, exist_ok=True)
@@ -111,20 +96,8 @@ HEADERS_CSV = {
 
 HEADERS = HEADERS_NAVEGADOR
 
-PRODUTO_PALAVRAS = {
-    "gasolina": ["gasolina"],
-    "etanol": ["etanol"],
-    "diesel": ["diesel"],
-    "gnv": ["gnv"],
-    "glp": ["glp"],
-}
-
-# ======================== SESSÃO PERSISTENTE ========================
 _sessao = requests.Session()
 _sessao.headers.update(HEADERS_NAVEGADOR)
-
-def _obter_session():
-    return _sessao
 
 # ======================== UTILITÁRIOS ========================
 def normalizar_texto(texto):
@@ -155,11 +128,6 @@ def _petrobras_cache_path(produto: str, uf: str) -> str:
     chave = _petrobras_cache_key(produto, uf)
     h = hashlib.md5(chave.encode("utf-8")).hexdigest()
     return os.path.join(CACHE_PETROBRAS_DIR, f"{h}.json")
-
-def _eletro_cache_path(lat: float, lon: float, raio_km: float) -> str:
-    chave = f"{lat:.4f}_{lon:.4f}_{raio_km:.0f}"
-    h = hashlib.md5(chave.encode("utf-8")).hexdigest()
-    return os.path.join(CACHE_ELETRO_DIR, f"{h}.json")
 
 def _ler_petrobras_cache_disco(produto: str, uf: str):
     caminho = _petrobras_cache_path(produto, uf)
@@ -199,7 +167,6 @@ def validar_preco(produto_label: str, preco: float):
     return minimo <= preco <= maximo
 
 def calcular_distancia_km(lat1, lon1, lat2, lon2):
-    """Fórmula de Haversine — distância entre dois pontos em km."""
     try:
         from math import radians, sin, cos, sqrt, atan2
         R = 6371.0
@@ -216,7 +183,6 @@ def geocodificar_por_cep(cep: str) -> dict:
     cep_limpo = re.sub(r"\D", "", str(cep or ""))
     if len(cep_limpo) != 8:
         return None
-
     cache_file = _cep_cache_path(cep_limpo)
     if os.path.exists(cache_file):
         try:
@@ -228,7 +194,6 @@ def geocodificar_por_cep(cep: str) -> dict:
                 return None
         except Exception:
             pass
-
     try:
         url = BRASILAPI_CEP_URL.format(cep=cep_limpo)
         r = _sessao.get(url, timeout=10)
@@ -264,11 +229,6 @@ def geocodificar_por_cep(cep: str) -> dict:
                     return resultado
             except (ValueError, TypeError):
                 pass
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump({"_ts": time.time(), "latitude": None, "longitude": None}, f)
-        except Exception:
-            pass
         return None
     except Exception as e:
         print(f"⚠️ [CEP] erro geocodificando {cep_limpo}: {e}")
@@ -304,7 +264,6 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
                 return postos
         except Exception:
             pass
-
     postos = []
     try:
         params = {"municipio": municipio.upper().strip(), "uf": uf.upper().strip()}
@@ -313,7 +272,6 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
         print(f"📡 [API ANP] status: {r.status_code}")
         r.raise_for_status()
         dados = r.json()
-
         itens = []
         if isinstance(dados, dict):
             itens = dados.get("data") or dados.get("items") or []
@@ -321,28 +279,22 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
                 itens = []
         elif isinstance(dados, list):
             itens = dados
-
         print(f"📡 [API ANP] {len(itens)} registros brutos recebidos")
-
         for item in itens:
             posto = _extrair_posto_api(item, municipio, uf)
             if posto:
                 postos.append(posto)
-
         unicos = {}
         for p in postos:
             unicos[p["cnpj"]] = p
         postos = list(unicos.values())
-
         print(f"✅ [API ANP] {len(postos)} postos únicos em {municipio}/{uf}")
-
         try:
             with open(cache_file, "w", encoding="utf-8") as f:
                 json.dump({"_ts": time.time(), "postos": postos}, f, ensure_ascii=False)
         except Exception as e:
             print(f"⚠️ [API ANP] erro salvando cache: {e}")
         return postos
-
     except Exception as e:
         print(f"❌ [API ANP] erro: {e}")
         if os.path.exists(cache_file):
@@ -358,14 +310,11 @@ def buscar_postos_anp_api(municipio: str, uf: str) -> list:
 def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
     if not isinstance(item, dict):
         return None
-
     cnpj = normalizar_cnpj(item.get("cnpj") or item.get("CNPJ") or "")
     if not cnpj:
         return None
-
     lat_str = item.get("latitude") or item.get("Latitude")
     lon_str = item.get("longitude") or item.get("Longitude")
-
     lat_f = lon_f = None
     try:
         if lat_str not in (None, ""):
@@ -381,12 +330,10 @@ def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
                 lon_f = b
     except (ValueError, TypeError):
         pass
-
     endereco = item.get("endereco") or item.get("Endereço") or ""
     endereco = re.sub(r"\s+", " ", str(endereco)).strip().strip(",")
     if not endereco:
         endereco = "Endereço não disponível na base ANP"
-
     return {
         "cnpj": cnpj,
         "revenda": item.get("razaoSocial") or item.get("razao_social") or item.get("Razão Social") or "",
@@ -466,7 +413,6 @@ def descobrir_urls_csv_anp():
         r = _sessao.get(PAGINA_ANP, headers=HEADERS_NAVEGADOR, timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "html.parser")
-
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if not href.lower().endswith(".csv"):
@@ -474,12 +420,10 @@ def descobrir_urls_csv_anp():
             href_lower = href.lower()
             if "ultimas-4-semanas" not in href_lower and "/qus/" not in href_lower:
                 continue
-
             if href.startswith("/"):
                 href = "https://www.gov.br" + href
             elif not href.startswith("http"):
                 href = "https://www.gov.br/anp/" + href.lstrip("/")
-
             if "gasolina" in href_lower or "etanol" in href_lower:
                 urls_encontradas.setdefault("gasolina-etanol", href)
             elif "diesel" in href_lower:
@@ -488,37 +432,12 @@ def descobrir_urls_csv_anp():
                 urls_encontradas.setdefault("glp", href)
             elif "gnv" in href_lower:
                 urls_encontradas.setdefault("diesel-gnv", href)
-
-        if not urls_encontradas:
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if not href.lower().endswith(".csv"):
-                    continue
-                href_lower = href.lower()
-                if "semana" not in href_lower and "qus" not in href_lower:
-                    continue
-                if href.startswith("/"):
-                    href = "https://www.gov.br" + href
-                elif not href.startswith("http"):
-                    href = "https://www.gov.br/anp/" + href.lstrip("/")
-
-                if "gasolina" in href_lower or "etanol" in href_lower:
-                    urls_encontradas.setdefault("gasolina-etanol", href)
-                elif "diesel" in href_lower or "gnv" in href_lower:
-                    urls_encontradas.setdefault("diesel-gnv", href)
-                elif "glp" in href_lower:
-                    urls_encontradas.setdefault("glp", href)
-
         if urls_encontradas:
             print(f"✅ [ANP] descobertos {len(urls_encontradas)} links via scraping")
-        else:
-            print(f"⚠️ [ANP] nenhum link .csv encontrado na página")
-
         return urls_encontradas
     except Exception as e:
         print(f"❌ [ANP] erro raspando página: {e}")
         return {}
-
 
 def _mapear_produto_para_grupo(produto: str):
     p = produto.lower()
@@ -530,12 +449,10 @@ def _mapear_produto_para_grupo(produto: str):
         return "glp"
     return None
 
-
 def obter_url_csv(produto: str) -> str:
     produto_lower = produto.lower()
     cache_link_file = os.path.join(CACHE_API_DIR, "ultimo_link_anp.json")
     grupo = _mapear_produto_para_grupo(produto_lower)
-
     urls_descobertas = descobrir_urls_csv_anp()
     if urls_descobertas and grupo and grupo in urls_descobertas:
         url = urls_descobertas[grupo]
@@ -550,11 +467,9 @@ def obter_url_csv(produto: str) -> str:
         except Exception:
             pass
         return url
-
     if produto_lower in CSV_URLS_ANP and CSV_URLS_ANP[produto_lower]:
         print(f"ℹ️ [ANP] usando URL hard-coded para {produto_lower}")
         return CSV_URLS_ANP[produto_lower][0]
-
     if os.path.exists(cache_link_file):
         try:
             with open(cache_link_file, "r", encoding="utf-8") as f:
@@ -564,61 +479,47 @@ def obter_url_csv(produto: str) -> str:
                 return cache[grupo]["url"]
         except Exception:
             pass
-
-    print(f"❌ [ANP] não foi possível descobrir URL para {produto_lower}")
     return None
-
 
 def encontrar_link_csv_anp(produto="gasolina"):
     url = obter_url_csv(produto)
     if not url:
         return None
-
     try:
         print(f"🔗 [CSV] testando URL: {url}")
         r = _sessao.get(url, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
         ct = (r.headers.get("content-type") or "").lower()
         status = r.status_code
-
         if status == 200 and ("csv" in ct or "octet-stream" in ct or "text/plain" in ct or "text/html" not in ct):
             chunk = next(r.iter_content(chunk_size=1), b"")
             r.close()
             if chunk:
                 print(f"✅ [CSV] URL válida: {url}")
                 return url
-            else:
-                print(f"⚠️ [CSV] URL retornou vazio: {url}")
         else:
-            print(f"⚠️ [CSV] URL retornou {status} (content-type: {ct}): {url}")
             r.close()
     except Exception as e:
         print(f"⚠️ [CSV] erro testando {url}: {e}")
-
     for url_alt in CSV_URLS_ANP.get(produto.lower(), []):
         if url_alt == url:
             continue
         try:
-            print(f"🔗 [CSV] tentando fallback: {url_alt}")
             r = _sessao.get(url_alt, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code == 200 and "text/html" not in ct:
                 chunk = next(r.iter_content(chunk_size=1), b"")
                 r.close()
                 if chunk:
-                    print(f"✅ [CSV] fallback válido: {url_alt}")
                     return url_alt
-        except Exception as e:
-            print(f"⚠️ [CSV] fallback falhou: {e}")
-
-    print(f"❌ [CSV] nenhuma URL funcionou para {produto}")
+        except Exception:
+            pass
     return None
 
-# ======================== HEALTH ========================
+# ======================== HEALTH E TESTES ========================
 @app.get("/")
 def health():
     return {"status": "ok", "service": "combustivel"}
 
-# ======================== TESTES ========================
 @app.get("/api/testar-api-anp")
 def testar_api_anp(municipio: str = "VITORIA", uf: str = "ES"):
     params = {"municipio": municipio.upper(), "uf": uf.upper()}
@@ -655,35 +556,10 @@ def testar_api_anp(municipio: str = "VITORIA", uf: str = "ES"):
         resultado["erro"] = str(e)
     return resultado
 
-@app.get("/api/testar-csvs")
-def testar_csvs():
-    resultado = {}
-    for produto, urls in CSV_URLS_ANP.items():
-        resultado[produto] = []
-        for url in urls:
-            try:
-                r = _sessao.get(url, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
-                chunk = next(r.iter_content(chunk_size=200), b"")
-                preview = chunk[:200].decode("latin1", errors="ignore") if chunk else ""
-                resultado[produto].append({
-                    "url": url,
-                    "status": r.status_code,
-                    "content_type": r.headers.get("content-type"),
-                    "preview": preview.replace("\n", " ")[:150],
-                })
-                r.close()
-            except Exception as e:
-                resultado[produto].append({"url": url, "erro": str(e)})
-    return resultado
-
 @app.get("/api/descobrir-links-anp")
 def descobrir_links_anp():
     urls = descobrir_urls_csv_anp()
-    return {
-        "total": len(urls),
-        "links_encontrados": urls,
-        "pagina_raspada": PAGINA_ANP,
-    }
+    return {"total": len(urls), "links_encontrados": urls, "pagina_raspada": PAGINA_ANP}
 
 @app.get("/api/baixar-csv")
 def baixar_csv(tipo: str = "gasolina"):
@@ -691,50 +567,38 @@ def baixar_csv(tipo: str = "gasolina"):
         if tipo.lower() not in CSV_URLS_ANP:
             raise Exception(f"Produto desconhecido: {tipo}")
         os.makedirs(CSV_DATA_DIR, exist_ok=True)
-
         csv_url = encontrar_link_csv_anp(tipo)
-
         if not csv_url:
             csv_local = obter_csv_mais_recente(tipo)
             if csv_local:
                 idade = idade_csv_dias(csv_local)
-                print(f"⚠️ [baixar-csv] {tipo}: nenhuma URL válida. Usando CSV local ({idade:.1f} dias).")
                 return {
-                    "status": "ok_offline",
-                    "arquivo": csv_local,
-                    "url_usada": None,
+                    "status": "ok_offline", "arquivo": csv_local, "url_usada": None,
                     "tamanho_bytes": os.path.getsize(csv_local),
                     "aviso": f"Não foi possível baixar CSV novo. Usando arquivo local com {idade:.1f} dias.",
                 }
             raise Exception(f"CSV não encontrado para {tipo} e não há arquivo local.")
-
         r = _sessao.get(csv_url, headers=HEADERS_CSV, timeout=180, stream=True, allow_redirects=True)
         r.raise_for_status()
-
         ct = (r.headers.get("content-type") or "").lower()
         if "text/html" in ct and "csv" not in ct:
             raise Exception(f"Servidor retornou HTML em vez de CSV")
-
         caminho_destino = gerar_nome_csv(tipo)
         with open(caminho_destino, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-
         tamanho = os.path.getsize(caminho_destino)
         if tamanho < 1000:
             os.remove(caminho_destino)
             csv_local = obter_csv_mais_recente(tipo)
             if csv_local:
                 return {
-                    "status": "ok_offline",
-                    "arquivo": csv_local,
-                    "url_usada": csv_url,
+                    "status": "ok_offline", "arquivo": csv_local, "url_usada": csv_url,
                     "tamanho_bytes": os.path.getsize(csv_local),
                     "aviso": "Download falhou (arquivo muito pequeno). Usando CSV local.",
                 }
             raise Exception(f"Arquivo muito pequeno ({tamanho} bytes)")
-
         print(f"✅ [baixar-csv] {tipo}: {tamanho} bytes salvos em {caminho_destino}")
         return {"status": "ok", "arquivo": caminho_destino, "url_usada": csv_url, "tamanho_bytes": tamanho}
     except Exception as e:
@@ -742,21 +606,18 @@ def baixar_csv(tipo: str = "gasolina"):
         csv_local = obter_csv_mais_recente(tipo)
         if csv_local:
             return {
-                "status": "ok_offline",
-                "arquivo": csv_local,
-                "url_usada": None,
+                "status": "ok_offline", "arquivo": csv_local, "url_usada": None,
                 "tamanho_bytes": os.path.getsize(csv_local),
                 "aviso": f"Erro no download: {str(e)}. Usando CSV local.",
             }
         return {"erro": str(e)}
 
-# ======================== GARANTIR TODOS OS CSVs ========================
+# ======================== GARANTIR CSVs ========================
 def garantir_todos_csvs(force_rebaixar_antigos=True):
     status_por_produto = {}
     for produto in PRODUTOS:
         caminho = obter_csv_mais_recente(produto)
         idade = idade_csv_dias(caminho)
-
         if caminho is None:
             print(f"📥 [garantir] {produto}: sem CSV local, baixando...")
             resultado = baixar_csv(tipo=produto)
@@ -767,7 +628,6 @@ def garantir_todos_csvs(force_rebaixar_antigos=True):
                 "erro": resultado.get("erro"),
             }
             continue
-
         if force_rebaixar_antigos and idade is not None and idade > IDADE_MAXIMA_CSV_DIAS:
             print(f"📥 [garantir] {produto}: CSV com {idade:.1f} dias, rebaixando...")
             resultado = baixar_csv(tipo=produto)
@@ -781,27 +641,46 @@ def garantir_todos_csvs(force_rebaixar_antigos=True):
             }
         else:
             status_por_produto[produto] = {
-                "acao": "ok",
-                "ok": True,
-                "arquivo": caminho,
+                "acao": "ok", "ok": True, "arquivo": caminho,
                 "idade_dias": round(idade, 2) if idade is not None else None,
             }
     return status_por_produto
 
-# ======================== LEITURA E PARSING DO CSV ========================
+# ======================== PARSING CSV ========================
 def _extrair_data_referencia(df: pd.DataFrame):
-    col_ini = col_fim = None
+    col_ini = col_fim = col_unica = None
     for col in df.columns:
         cl = col.lower()
         if "data" in cl and "inicial" in cl:
             col_ini = col
-        if "data" in cl and "final" in cl:
+        elif "data" in cl and "final" in cl:
             col_fim = col
+        elif "data" in cl and ("coleta" in cl or "pesquisa" in cl):
+            col_unica = col
+
     try:
-        ini = str(df[col_ini].dropna().iloc[0]) if col_ini else None
-        fim = str(df[col_fim].dropna().iloc[0]) if col_fim else None
-        if ini or fim:
-            return {"data_inicial": ini, "data_final": fim}
+        if col_ini or col_fim:
+            ini = str(df[col_ini].dropna().iloc[0]) if col_ini else None
+            fim = str(df[col_fim].dropna().iloc[0]) if col_fim else None
+            if ini or fim:
+                return {"data_inicial": ini, "data_final": fim}
+        if col_unica:
+            valores = df[col_unica].dropna().astype(str).unique().tolist()
+            if valores:
+                def _parse_data(s):
+                    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+                        try:
+                            return datetime.strptime(s.strip()[:10], fmt)
+                        except Exception:
+                            continue
+                    return None
+                valores_parsed = [(v, _parse_data(v)) for v in valores]
+                valores_validos = [v for v, d in valores_parsed if d is not None]
+                if valores_validos:
+                    valores_validos.sort(key=lambda s: _parse_data(s) or datetime.min)
+                    maior = valores_validos[-1]
+                    return {"data_inicial": maior, "data_final": maior}
+                return {"data_inicial": valores[0], "data_final": valores[0]}
     except Exception:
         pass
     return None
@@ -829,115 +708,71 @@ def _detectar_colunas(df: pd.DataFrame):
 # ======================== ENDPOINT PRINCIPAL ========================
 @app.get("/api/precos")
 def get_precos(
-    municipio: str,
-    uf: str,
-    produto: str = None,
+    municipio: str, uf: str, produto: str = None,
     incluir_sem_preco: bool = Query(True),
     geocodificar_cep: bool = Query(True),
 ):
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
-
-    print(f"\n{'='*60}")
-    print(f"🔍 {municipio}/{uf} - produto: {produto or 'todos'}")
-    print(f"{'='*60}")
-
+    print(f"\n{'='*60}\n🔍 {municipio}/{uf} - produto: {produto or 'todos'}\n{'='*60}")
     postos_api = buscar_postos_anp_api(municipio, uf)
     print(f"📋 Base ANP: {len(postos_api)} postos autorizados em {municipio}/{uf}")
-
     if geocodificar_cep and postos_api:
         postos_api = enriquecer_postos_sem_coordenada(postos_api, limite=40)
-
     garantir_todos_csvs(force_rebaixar_antigos=True)
-
     csvs_disponiveis = {p: obter_csv_mais_recente(p) for p in PRODUTOS}
-
     if not any(csvs_disponiveis.values()):
-        print("⚠️ Nenhum CSV disponível. Retornando apenas cadastro ANP.")
         if postos_api:
             postos_sem_preco = []
             for p in postos_api:
-                postos_sem_preco.append({
-                    **p,
-                    "cnpj": normalizar_cnpj(p["cnpj"]),
-                    "preco": 0.0,
-                    "tem_preco": False,
-                    "fonte_dado": "sem_csv",
-                })
-            postos_sem_preco.sort(
-                key=lambda p: normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or "")
-            )
+                postos_sem_preco.append({**p, "cnpj": normalizar_cnpj(p["cnpj"]), "preco": 0.0, "tem_preco": False, "fonte_dado": "sem_csv"})
+            postos_sem_preco.sort(key=lambda p: normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or ""))
             return {
-                "municipio": municipio, "uf": uf,
-                "fonte_api_anp": len(postos_api),
-                "aviso": "CSVs de preços indisponíveis — mostrando apenas cadastro de postos",
-                "produtos": {
-                    (produto or "gasolina").lower(): {
-                        "media": None, "minimo": None, "maximo": None,
-                        "total_postos": len(postos_sem_preco),
-                        "total_com_preco": 0,
-                        "total_sem_preco": len(postos_sem_preco),
-                        "fonte_dado": "sem_csv",
-                        "postos": postos_sem_preco,
-                    }
-                },
+                "municipio": municipio, "uf": uf, "fonte_api_anp": len(postos_api),
+                "aviso": "CSVs de preços indisponíveis",
+                "produtos": {(produto or "gasolina").lower(): {
+                    "media": None, "minimo": None, "maximo": None,
+                    "total_postos": len(postos_sem_preco), "total_com_preco": 0,
+                    "total_sem_preco": len(postos_sem_preco), "fonte_dado": "sem_csv",
+                    "postos": postos_sem_preco,
+                }},
             }
         raise HTTPException(status_code=500, detail="Nenhum CSV disponível e nenhum posto na base ANP.")
-
     try:
         resultados = {}
-
         for tipo_csv, caminho in csvs_disponiveis.items():
             if not caminho:
                 continue
-
             idade = idade_csv_dias(caminho)
             fonte_dado = "csv_anp_atual" if (idade is not None and idade <= IDADE_MAXIMA_CSV_DIAS) else "csv_anp_antigo"
-
-            print(f"📂 Lendo: {caminho} (idade: {idade:.1f} dias)" if idade is not None else f"📂 Lendo: {caminho}")
             try:
                 df = pd.read_csv(caminho, sep=";", encoding="latin1", decimal=",")
             except Exception as e:
                 print(f"⚠️ Erro lendo {caminho}: {e}")
                 continue
-
             df.columns = [c.replace("ï»¿", "").strip() for c in df.columns]
-
             data_ref = _extrair_data_referencia(df)
             cols = _detectar_colunas(df)
-
             if not all([cols["municipio"], cols["uf"], cols["produto"], cols["valor"]]):
-                print(f"⚠️ Colunas obrigatórias faltando em {caminho}: {list(df.columns)}")
                 continue
-
             df["_municipio_norm"] = df[cols["municipio"]].astype(str).apply(normalizar_texto)
             df["_uf_norm"] = df[cols["uf"]].astype(str).apply(normalizar_texto)
             df["_produto_norm"] = df[cols["produto"]].astype(str).apply(normalizar_texto)
-
             df_filtrado = df[(df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)]
             if df_filtrado.empty:
                 df_filtrado = df[(df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)]
             if df_filtrado.empty:
                 continue
-
             mapeamento_produtos = [
-                ("GASOLINA ADITIVADA", "gasolina_aditivada"),
-                ("GASOLINA", "gasolina"),
-                ("ETANOL HIDRATADO", "etanol"),
-                ("ETANOL", "etanol"),
-                ("DIESEL S10", "diesel_s10"),
-                ("DIESEL S-10", "diesel_s10"),
-                ("DIESEL S500", "diesel_s500"),
-                ("DIESEL S-500", "diesel_s500"),
-                ("DIESEL", "diesel"),
-                ("GNV", "gnv"),
-                ("GLP", "glp"),
+                ("GASOLINA ADITIVADA", "gasolina_aditivada"), ("GASOLINA", "gasolina"),
+                ("ETANOL HIDRATADO", "etanol"), ("ETANOL", "etanol"),
+                ("DIESEL S10", "diesel_s10"), ("DIESEL S-10", "diesel_s10"),
+                ("DIESEL S500", "diesel_s500"), ("DIESEL S-500", "diesel_s500"),
+                ("DIESEL", "diesel"), ("GNV", "gnv"), ("GLP", "glp"),
             ]
-
             for prod_chave, prod_label in mapeamento_produtos:
                 if produto and prod_label != produto.lower():
                     continue
-
                 if prod_chave == "GASOLINA":
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA"]
                 elif prod_chave == "GASOLINA ADITIVADA":
@@ -950,7 +785,6 @@ def get_precos(
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "DIESEL"]
                 else:
                     df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
-
                 mapa_precos = {}
                 descartados_outlier = 0
                 if not df_prod.empty:
@@ -969,23 +803,13 @@ def get_precos(
                             "preco": round(preco, 2),
                             "bandeira": str(row[cols["bandeira"]]) if cols["bandeira"] else "",
                         }
-
-                if descartados_outlier:
-                    print(f"  ⚠️ {prod_label}: {descartados_outlier} preços fora da faixa plausível descartados")
-
                 postos_merge = {}
                 for p in postos_api:
                     cnpj_key = normalizar_cnpj(p["cnpj"])
                     postos_merge[cnpj_key] = {
-                        **p,
-                        "cnpj": cnpj_key,
-                        "preco": 0.0,
-                        "tem_preco": False,
-                        "produto": prod_label.upper(),
-                        "cnpj_orfao": False,
-                        "fonte_dado": fonte_dado,
+                        **p, "cnpj": cnpj_key, "preco": 0.0, "tem_preco": False,
+                        "produto": prod_label.upper(), "cnpj_orfao": False, "fonte_dado": fonte_dado,
                     }
-
                 for cnpj_limpo, dados_preco in mapa_precos.items():
                     if cnpj_limpo in postos_merge:
                         postos_merge[cnpj_limpo]["preco"] = dados_preco["preco"]
@@ -994,86 +818,46 @@ def get_precos(
                             postos_merge[cnpj_limpo]["bandeira"] = dados_preco["bandeira"]
                     else:
                         postos_merge[cnpj_limpo] = {
-                            "cnpj": cnpj_limpo,
-                            "revenda": f"Posto {cnpj_limpo}",
-                            "endereco": "Endereço não disponível na base ANP",
-                            "bairro": "",
-                            "municipio": municipio,
-                            "uf": uf,
-                            "cep": "",
-                            "bandeira": dados_preco["bandeira"],
-                            "preco": dados_preco["preco"],
-                            "tem_preco": True,
-                            "produto": prod_label.upper(),
-                            "latitude": None,
-                            "longitude": None,
+                            "cnpj": cnpj_limpo, "revenda": f"Posto {cnpj_limpo}",
+                            "endereco": "Endereço não disponível na base ANP", "bairro": "",
+                            "municipio": municipio, "uf": uf, "cep": "",
+                            "bandeira": dados_preco["bandeira"], "preco": dados_preco["preco"],
+                            "tem_preco": True, "produto": prod_label.upper(),
+                            "latitude": None, "longitude": None,
                             "aviso": "Endereço não disponível na base ANP",
-                            "cnpj_orfao": True,
-                            "fonte_dado": fonte_dado,
+                            "cnpj_orfao": True, "fonte_dado": fonte_dado,
                         }
-
                 postos_lista = list(postos_merge.values())
-
-                precos_validos = [
-                    p["preco"] for p in postos_lista
-                    if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0
-                ]
-
+                precos_validos = [p["preco"] for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0]
                 if not incluir_sem_preco:
-                    postos_lista = [
-                        p for p in postos_lista
-                        if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0
-                    ]
-
+                    postos_lista = [p for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0]
                 if not postos_lista:
                     continue
-
                 if precos_validos:
                     media = round(sum(precos_validos) / len(precos_validos), 2)
                     minimo = round(min(precos_validos), 2)
                     maximo = round(max(precos_validos), 2)
                 else:
                     media = minimo = maximo = None
-
                 postos_lista.sort(key=lambda p: (
                     0 if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 1,
                     p["preco"] if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 9999,
                     normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or ""),
                 ))
-
                 com_preco = sum(1 for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0)
                 sem_preco = len(postos_lista) - com_preco
                 orfaos = sum(1 for p in postos_lista if p.get("cnpj_orfao"))
-
-                print(f"  ✅ {prod_label}: {len(postos_lista)} postos ({com_preco} c/ preço, {sem_preco} s/ preço, {orfaos} órfãos)")
-
                 if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
                     resultados[prod_label] = {
-                        "media": media,
-                        "minimo": minimo,
-                        "maximo": maximo,
-                        "total_postos": len(postos_lista),
-                        "total_com_preco": com_preco,
-                        "total_sem_preco": sem_preco,
-                        "total_cnpj_orfao": orfaos,
-                        "fonte_dado": fonte_dado,
-                        "data_referencia": data_ref,
+                        "media": media, "minimo": minimo, "maximo": maximo,
+                        "total_postos": len(postos_lista), "total_com_preco": com_preco,
+                        "total_sem_preco": sem_preco, "total_cnpj_orfao": orfaos,
+                        "fonte_dado": fonte_dado, "data_referencia": data_ref,
                         "postos": postos_lista,
                     }
-
         if not resultados:
-            return {
-                "erro": "Nenhum posto encontrado",
-                "municipio": municipio, "uf": uf,
-                "produtos": {}, "fonte_api_anp": len(postos_api),
-            }
-
-        return {
-            "municipio": municipio, "uf": uf,
-            "fonte_api_anp": len(postos_api),
-            "produtos": resultados,
-        }
-
+            return {"erro": "Nenhum posto encontrado", "municipio": municipio, "uf": uf, "produtos": {}, "fonte_api_anp": len(postos_api)}
+        return {"municipio": municipio, "uf": uf, "fonte_api_anp": len(postos_api), "produtos": resultados}
     except HTTPException:
         raise
     except Exception as e:
@@ -1146,29 +930,23 @@ def atualizar_agora():
     resultado = garantir_todos_csvs(force_rebaixar_antigos=True)
     return {"status": "ok", "mensagem": "Verificação concluída.", "detalhes": resultado}
 
-# ======================== STATUS AGREGADO ========================
 @app.get("/api/status-dados")
 def status_dados():
     resultado = {
-        "csvs": {},
-        "api_anp": None,
-        "petrobras": {},
+        "csvs": {}, "api_anp": None, "petrobras": {},
         "agendador": {
             "intervalo_horas": INTERVALO_VERIFICACAO_HORAS,
             "rodando": scheduler.running if 'scheduler' in globals() else False,
         },
     }
-
     for produto in PRODUTOS:
         caminho = obter_csv_mais_recente(produto)
         idade = idade_csv_dias(caminho)
         resultado["csvs"][produto] = {
-            "arquivo": caminho,
-            "existe": caminho is not None,
+            "arquivo": caminho, "existe": caminho is not None,
             "idade_dias": round(idade, 2) if idade is not None else None,
             "fonte_dado": "csv_anp_atual" if (idade is not None and idade <= IDADE_MAXIMA_CSV_DIAS) else ("csv_anp_antigo" if caminho else "sem_csv"),
         }
-
     try:
         test = testar_api_anp()
         resultado["api_anp"] = {
@@ -1179,7 +957,6 @@ def status_dados():
         }
     except Exception as e:
         resultado["api_anp"] = {"status": "erro", "erro": str(e)}
-
     for prod in ["gasolina", "diesel", "glp", "gnv"]:
         dados = raspar_composicao_petrobras(prod)
         resultado["petrobras"][prod] = {
@@ -1188,94 +965,375 @@ def status_dados():
             "periodo": dados.get("periodo") if dados else None,
             "cache_origem": dados.get("cache_origem") if dados else None,
         }
-
     return resultado
 
 # ======================== COMPOSIÇÃO PETROBRAS ========================
-def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
-    uf_norm = (uf or "BR").upper().strip()
-    cache_key = _petrobras_cache_key(produto, uf_norm)
-    agora = time.time()
+PETROBRAS_SLUG = {
+    "gasolina": "gasolina",
+    "diesel":   "diesel",
+    "glp":      "gas-de-cozinha",
+    "gnv":      "gnv",
+}
 
-    if cache_key in PETROBRAS_CACHE:
-        dados_cache, timestamp = PETROBRAS_CACHE[cache_key]
-        if agora - timestamp < PETROBRAS_CACHE_TTL:
-            dados_cache["cache_origem"] = "memoria"
-            print(f"⚡ [Petrobras] cache memória para {produto}/{uf_norm}")
-            return dados_cache
+# ✅ Componentes obrigatórios POR PRODUTO (GLP/GNV não têm biocombustível)
+COMPONENTES_POR_PRODUTO = {
+    "gasolina": ["parcela_petrobras", "impostos_federais", "icms",
+                 "biocombustivel", "margem_distribuicao_revenda"],
+    "diesel":   ["parcela_petrobras", "impostos_federais", "icms",
+                 "biocombustivel", "margem_distribuicao_revenda"],
+    "glp":      ["parcela_petrobras", "impostos_federais", "icms",
+                 "margem_distribuicao_revenda"],
+    "gnv":      ["parcela_petrobras", "impostos_federais", "icms",
+                 "margem_distribuicao_revenda"],
+}
 
-    dados_disco = _ler_petrobras_cache_disco(produto, uf_norm)
-    if dados_disco:
-        return dados_disco
+def _componentes_obrigatorios(produto: str) -> list:
+    return COMPONENTES_POR_PRODUTO.get(produto.lower(), COMPONENTES_POR_PRODUTO["gasolina"])
 
-    urls = {
-        "gasolina": "https://precos.petrobras.com.br/precos-gasolina",
-        "diesel": "https://precos.petrobras.com.br/precos-diesel",
-        "glp": "https://precos.petrobras.com.br/precos-glp",
-    }
-    url = urls.get(produto.lower())
-    if not url:
+# Mantém o nome antigo para compatibilidade, mas agora é uma lista genérica
+COMPONENTES_OBRIGATORIOS = COMPONENTES_POR_PRODUTO["gasolina"]
+
+def _parse_valor_brl(txt: str):
+    """Extrai valor R$ X,XX de um texto."""
+    if not txt:
+        return None
+    m = re.search(r"R\$\s*([\d.]+,\d{2}|\d+,\d{2}|\d+\.\d{2})", txt)
+    if not m:
+        return None
+    s = m.group(1).replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
         return None
 
-    params = {}
-    if uf_norm and uf_norm != "BR":
-        params["estado"] = uf_norm
 
+def _parse_numero_simples(txt: str):
+    """Aceita '1,51' ou '1.51' como float."""
+    if not txt:
+        return None
+    txt = str(txt).strip()
+    # Tenta formato brasileiro primeiro
+    m = re.match(r"^(\d{1,3}(?:\.\d{3})*,\d{1,2}|\d+,\d{1,2})$", txt)
+    if m:
+        try:
+            return float(txt.replace(".", "").replace(",", "."))
+        except ValueError:
+            pass
+    # Tenta formato decimal internacional
     try:
-        r = _sessao.get(url, params=params, timeout=15)
-        r.raise_for_status()
+        return float(txt.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _scrape_petrobras_pagina(url: str):
+    """
+    Raspa a página da Petrobras.
+
+    ✅ Padrão REAL observado no HTML (confirmado via /api/debug-petrobras):
+        [idx 116] "R$"
+        [idx 117] "1,51"
+        [idx 118] "Distribuicão e Revenda"
+        [idx 122] "R$"
+        [idx 123] "0,98"
+        [idx 124] "Custo Etanol Anidro"
+        [idx 128] "R$"
+        [idx 129] "1,57"
+        [idx 130] "Imposto Estadual"
+        [idx 134] "R$"
+        [idx 135] "0,24"
+        [idx 136] "Impostos Federais"
+        [idx 140] "R$"
+        [idx 141] "2,06"
+        [idx 142] "Parcela Petrobras"
+
+    Ou seja: R$ + número vêm ANTES do rótulo, e o rótulo vem logo depois (idx +2).
+    Estratégia: para cada rótulo, buscar o valor nas ~3 linhas ANTES dele.
+    """
+    try:
+        r = _sessao.get(url, timeout=25, allow_redirects=True)
+        if r.status_code != 200:
+            print(f"⚠️ [Petrobras] HTTP {r.status_code} em {url}")
+            return None
+
         soup = BeautifulSoup(r.content, "html.parser")
         texto = soup.get_text(separator="\n")
         linhas = [l.strip() for l in texto.split("\n") if l.strip()]
-
         dados = {}
-        for i, linha in enumerate(linhas):
-            if "Preço Médio do Brasil" in linha or ("Preço Médio" in linha and "R$" in linha):
-                for j in range(i, min(len(linhas), i + 5)):
-                    if "R$" in linhas[j]:
-                        match = re.search(r"R\$\s*(\d+[,.]\d+)", linhas[j])
-                        if match:
-                            dados["preco_medio_final"] = float(match.group(1).replace(",", "."))
-                            break
+
+        # ─── 1. Período ───
+        for l in linhas:
+            m = re.search(r"(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})", l)
+            if m:
+                dados["periodo"] = f"{m.group(1)} a {m.group(2)}"
                 break
 
-        componentes = {
-            "Parcela Petrobras": "parcela_petrobras",
-            "Impostos Federais": "impostos_federais",
-            "Imposto Estadual": "icms", "ICMS": "icms",
-            "Custo Etanol Anidro": "biocombustivel", "Biodiesel": "biocombustivel",
-            "Distribuição e Revenda": "margem_distribuicao_revenda",
+        # ─── 2. Preço médio (do estado) ───
+        for i, l in enumerate(linhas):
+            if "preço médio" in l.lower() and "brasil" not in l.lower():
+                # valor costuma estar 1-3 linhas depois
+                for j in range(i, min(len(linhas), i + 5)):
+                    v = _parse_numero_simples(linhas[j])
+                    if v is not None and 0.5 < v < 500:
+                        dados["preco_medio_final"] = round(v, 2)
+                        break
+                if "preco_medio_final" in dados:
+                    break
+
+        # ─── 3. Preço médio do Brasil ───
+        for i, l in enumerate(linhas):
+            if "preço médio do brasil" in l.lower():
+                for j in range(i, min(len(linhas), i + 4)):
+                    v = _parse_numero_simples(linhas[j])
+                    if v is not None and 0.5 < v < 500:
+                        dados["preco_medio_brasil"] = round(v, 2)
+                        break
+                # também pega "R$ 6,55" na mesma linha
+                if "preco_medio_brasil" not in dados:
+                    v = _parse_valor_brl(l)
+                    if v is not None and 0.5 < v < 500:
+                        dados["preco_medio_brasil"] = round(v, 2)
+                break
+
+        # ─── 4. Componentes: buscar valor ANTES do rótulo ───
+        rotulos = {
+            "parcela petrobras": "parcela_petrobras",
+            "parcela da petrobras": "parcela_petrobras",
+            "impostos federais": "impostos_federais",
+            "imposto federal": "impostos_federais",
+            "imposto estadual": "icms",
+            "icms": "icms",
+            "custo etanol anidro": "biocombustivel",
+            "custo do etanol anidro": "biocombustivel",
+            "etanol anidro": "biocombustivel",
+            "biodiesel": "biocombustivel",
+            "custo biodiesel": "biocombustivel",
+            "distribuicao e revenda": "margem_distribuicao_revenda",
+            "distribuição e revenda": "margem_distribuicao_revenda",
+            "margem de distribuicao": "margem_distribuicao_revenda",
+            "margem de distribuição": "margem_distribuicao_revenda",
         }
 
-        for i, linha in enumerate(linhas):
-            for chave, campo in componentes.items():
-                if chave.lower() in linha.lower():
-                    for j in range(max(0, i - 3), min(len(linhas), i + 4)):
-                        if "R$" in linhas[j]:
-                            match = re.search(r"R\$\s*(\d+[,.]\d+)", linhas[j])
-                            if match:
-                                try:
-                                    dados[campo] = float(match.group(1).replace(",", "."))
-                                    break
-                                except ValueError:
-                                    pass
-
-        for linha in linhas:
-            match = re.search(r"(\d{2}/\d{2}/\d{4}\s*a\s*\d{2}/\d{2}/\d{4})", linha)
-            if match:
-                dados["periodo"] = match.group(1)
+        # Marcador de início da seção visual (evita pegar o texto explicativo)
+        idx_inicio_visual = 0
+        for i, l in enumerate(linhas):
+            if "preço médio" in l.lower() and (">" in l or ":" in l):
+                idx_inicio_visual = i
                 break
 
-        obrigatorios = ["parcela_petrobras", "impostos_federais", "icms",
-                        "biocombustivel", "margem_distribuicao_revenda", "preco_medio_final"]
-        if not all(c in dados for c in obrigatorios):
-            print(f"⚠️ [Petrobras] scraping incompleto para {produto}/{uf_norm}, campos: {list(dados.keys())}")
-            return None
+        # Constrói lista de valores (R$ + número) com suas posições
+        valores_com_pos = []
+        for i, l in enumerate(linhas):
+            if l.strip() in ("R$", "R$:"):
+                if i + 1 < len(linhas):
+                    v = _parse_numero_simples(linhas[i + 1])
+                    if v is not None and 0 <= v < 500:
+                        valores_com_pos.append((i, v))
+            else:
+                v = _parse_valor_brl(l)
+                if v is not None and 0 <= v < 500:
+                    valores_com_pos.append((i, v))
 
-        soma = sum(dados.get(c, 0) for c in [
-            "parcela_petrobras", "impostos_federais", "icms",
-            "biocombustivel", "margem_distribuicao_revenda"
-        ])
+        # Para cada rótulo, pega o valor imediatamente ANTES dele (nas últimas 6 linhas)
+        for i, l in enumerate(linhas):
+            if i < idx_inicio_visual:
+                continue
+            ll = normalizar_texto(l).lower()
+            for chave, campo in rotulos.items():
+                if campo in dados:
+                    continue
+                chave_norm = normalizar_texto(chave).lower()
+                if chave_norm == ll or chave_norm in ll:
+                    melhor_valor = None
+                    melhor_dist = 999
+                    for idx_valor, valor in valores_com_pos:
+                        if idx_valor < i and idx_valor >= i - 6:
+                            dist = i - idx_valor
+                            if dist < melhor_dist:
+                                melhor_dist = dist
+                                melhor_valor = valor
+                    if melhor_valor is not None:
+                        dados[campo] = round(melhor_valor, 2)
+                    break
+
+        # ─── 5. Fallback regex no HTML bruto (JSON embutido) ───
+        if len(dados) < len(COMPONENTES_OBRIGATORIOS) + 1:
+            html_text = r.text
+            regexes = {
+                "parcela_petrobras": [
+                    r'"?parcela[_ ]?petrobras"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?parcelaPetrobras"?\s*[:=]\s*"?([\d.,]+)',
+                ],
+                "impostos_federais": [
+                    r'"?impostos?[_ ]?federais?"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?impostoFederal"?\s*[:=]\s*"?([\d.,]+)',
+                ],
+                "icms": [
+                    r'"?icms"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?imposto[_ ]?estadual"?\s*[:=]\s*"?([\d.,]+)',
+                ],
+                "biocombustivel": [
+                    r'"?biocombustivel"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?custo[_ ]?etanol[_ ]?anidro"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?biodiesel"?\s*[:=]\s*"?([\d.,]+)',
+                ],
+                "margem_distribuicao_revenda": [
+                    r'"?margem[_ ]?distribuicao[_ ]?revenda"?\s*[:=]\s*"?([\d.,]+)',
+                    r'"?distribuicao[_ ]?revenda"?\s*[:=]\s*"?([\d.,]+)',
+                ],
+            }
+            for campo, patterns in regexes.items():
+                if campo in dados:
+                    continue
+                for pat in patterns:
+                    m = re.search(pat, html_text, re.IGNORECASE)
+                    if m:
+                        try:
+                            val = _parse_numero_simples(m.group(1))
+                            if val is not None and 0 <= val < 500:
+                                dados[campo] = round(val, 2)
+                                break
+                        except (ValueError, TypeError):
+                            continue
+
+        return dados if dados else None
+    except Exception as e:
+        print(f"⚠️ [Petrobras] erro em {url}: {e}")
+        return None
+
+
+@app.get("/api/debug-petrobras")
+def debug_petrobras(uf: str = "SP", produto: str = "gasolina"):
+    """Endpoint de debug: mostra tudo que o scraping extraiu e as linhas cruas."""
+    slug = PETROBRAS_SLUG.get(produto.lower())
+    if not slug:
+        raise HTTPException(status_code=400, detail="Produto inválido")
+    url = f"https://precos.petrobras.com.br/w/preco-{slug}-{uf.lower()}"
+    try:
+        r = _sessao.get(url, timeout=25, allow_redirects=True)
+        if r.status_code != 200:
+            return {"erro": f"HTTP {r.status_code}", "url": url}
+        soup = BeautifulSoup(r.content, "html.parser")
+        texto = soup.get_text(separator="\n")
+        linhas = [l.strip() for l in texto.split("\n") if l.strip()]
+        dados_parser = _scrape_petrobras_pagina(url)
+        return {
+            "url": url,
+            "status": r.status_code,
+            "dados_extraidos": dados_parser,
+            "total_linhas": len(linhas),
+            "linhas_relevantes": [
+                {"idx": i, "linha": l}
+                for i, l in enumerate(linhas)
+                if any(k in normalizar_texto(l).lower() for k in [
+                    "parcela", "imposto", "icms", "etanol", "biodiesel",
+                    "distribui", "revenda", "preço médio", "preco medio",
+                ]) or l.strip() == "R$"
+            ][:80],
+        }
+    except Exception as e:
+        return {"erro": str(e), "url": url}
+
+
+def _urls_petrobras(produto: str, uf: str):
+    slug = PETROBRAS_SLUG.get(produto)
+    if not slug:
+        return []
+    uf_l = (uf or "br").lower()
+    return [f"https://precos.petrobras.com.br/w/preco-{slug}-{uf_l}"]
+
+
+def _scrape_petrobras_completo(produto: str, uf: str):
+    candidatas = _urls_petrobras(produto, uf)
+    obrigatorios = _componentes_obrigatorios(produto)
+    melhor = None
+    melhor_url = None
+    melhor_score = -1
+    for url in candidatas:
+        print(f"🌐 [Petrobras] tentando: {url}")
+        d = _scrape_petrobras_pagina(url)
+        if not d:
+            continue
+        score = sum(1 for c in obrigatorios if c in d)
+        if score > melhor_score:
+            melhor, melhor_url, melhor_score = d, url, score
+        if score == len(obrigatorios):
+            print(f"✅ [Petrobras] URL completa encontrada: {url}")
+            return d, url
+    if melhor:
+        print(f"⚠️ [Petrobras] melhor resultado teve {melhor_score}/{len(obrigatorios)} componentes: {melhor_url}")
+    return melhor, melhor_url
+
+
+def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
+    uf_norm = (uf or "BR").upper().strip()
+    produto_norm = produto.lower().strip()
+    if produto_norm not in PETROBRAS_SLUG:
+        return None
+
+    obrigatorios = _componentes_obrigatorios(produto_norm)
+
+    cache_key = _petrobras_cache_key(produto_norm, uf_norm)
+    agora = time.time()
+    if cache_key in PETROBRAS_CACHE:
+        dados_cache, ts = PETROBRAS_CACHE[cache_key]
+        if agora - ts < PETROBRAS_CACHE_TTL:
+            dados_cache["cache_origem"] = "memoria"
+            print(f"⚡ [Petrobras] cache memória para {produto_norm}/{uf_norm}")
+            return dados_cache
+
+    dados_disco = _ler_petrobras_cache_disco(produto_norm, uf_norm)
+    if dados_disco:
+        if all(c in dados_disco for c in obrigatorios):
+            return dados_disco
+        print(f"🗑️ [Petrobras] cache disco incompleto descartado para {produto_norm}/{uf_norm}")
+        try:
+            os.remove(_petrobras_cache_path(produto_norm, uf_norm))
+        except Exception:
+            pass
+
+    dados_estado, url_estado_usada = (None, None)
+    if uf_norm != "BR":
+        print(f"🌐 [Petrobras] raspando estado {uf_norm}...")
+        dados_estado, url_estado_usada = _scrape_petrobras_completo(produto_norm, uf_norm)
+
+    print(f"🌐 [Petrobras] raspando Brasil...")
+    dados_brasil, url_brasil_usada = _scrape_petrobras_completo(produto_norm, "BR")
+
+    dados = None
+    origem = None
+    if dados_estado and all(c in dados_estado for c in obrigatorios):
+        dados = dict(dados_estado); origem = "estado"
+    elif dados_brasil and all(c in dados_brasil for c in obrigatorios):
+        dados = dict(dados_brasil); origem = "brasil_fallback"
+    elif dados_estado:
+        dados = dict(dados_estado); origem = "estado_incompleto"
+    elif dados_brasil:
+        dados = dict(dados_brasil); origem = "brasil_incompleto"
+    else:
+        print(f"❌ [Petrobras] nada raspado para {produto_norm}/{uf_norm}")
+        return None
+
+    dados["uf_consultada"] = uf_norm
+    dados["origem_uf"] = origem
+    if url_estado_usada:
+        dados["url_estado"] = url_estado_usada
+    if url_brasil_usada:
+        dados["url_brasil"] = url_brasil_usada
+
+    # Sempre tenta preencher preco_medio_brasil separado
+    if dados_brasil and "preco_medio_final" in dados_brasil and "preco_medio_brasil" not in dados:
+        dados["preco_medio_brasil"] = dados_brasil["preco_medio_final"]
+    if dados_brasil and "periodo" in dados_brasil and "periodo" not in dados:
+        dados["periodo"] = dados_brasil["periodo"]
+
+    # ✅ GLP/GNV não têm biocombustível — normaliza para 0.0
+    if produto_norm in ("glp", "gnv"):
+        dados.setdefault("biocombustivel", 0.0)
+
+    # Validação da soma
+    if all(c in dados for c in obrigatorios) and "preco_medio_final" in dados:
+        soma = sum(dados.get(c, 0) for c in obrigatorios)
         final = dados["preco_medio_final"]
         if final > 0:
             desvio = abs(soma - final) / final
@@ -1286,48 +1344,52 @@ def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
                 "consistente": desvio <= 0.05,
             }
 
-        dados["uf_consultada"] = uf_norm
-        dados["cache_origem"] = "scraping"
+    dados["cache_origem"] = "scraping"
 
+    if all(c in dados for c in obrigatorios):
         PETROBRAS_CACHE[cache_key] = (dados, agora)
-        _gravar_petrobras_cache_disco(produto, uf_norm, dados)
-        print(f"✅ [Petrobras] scraping OK para {produto}/{uf_norm} e cache gravado")
+        _gravar_petrobras_cache_disco(produto_norm, uf_norm, dados)
+        print(f"✅ [Petrobras] scraping completo e cache gravado para {produto_norm}/{uf_norm}")
+    else:
+        faltando = [c for c in obrigatorios if c not in dados]
+        print(f"⚠️ [Petrobras] scraping incompleto (faltam {faltando}) — não gravando cache")
 
-        return dados
-    except Exception as e:
-        print(f"❌ Erro scraping Petrobras {produto}/{uf_norm}: {e}")
-        caminho = _petrobras_cache_path(produto, uf_norm)
-        if os.path.exists(caminho):
-            try:
-                with open(caminho, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                dados = cached.get("dados")
-                if dados:
-                    dados["cache_origem"] = "disco_expirado"
-                    dados["aviso"] = "scraping falhou; usando cache expirado do disco"
-                    print(f"⚠️ [Petrobras] usando cache disco expirado para {produto}/{uf_norm}")
-                    return dados
-            except Exception:
-                pass
-        return None
+    return dados
+
 
 @app.get("/api/composicao")
 def get_composicao(uf: str = "BR", produto: str = "gasolina"):
+    produto_lower = produto.lower()
     dados = raspar_composicao_petrobras(produto, uf=uf)
-    if not dados:
+
+    obrigatorios = _componentes_obrigatorios(produto_lower)
+    incompleto = not dados or any(c not in dados for c in obrigatorios)
+
+    if incompleto:
         fallback = {
-            "gasolina": {"parcela_petrobras": 2.08, "impostos_federais": 0.24, "icms": 1.57, "biocombustivel": 0.93, "margem_distribuicao_revenda": 1.72, "preco_medio_final": 6.54, "periodo": "Fallback estático"},
-            "diesel": {"parcela_petrobras": 2.76, "impostos_federais": 0.32, "icms": 1.12, "biocombustivel": 0.85, "margem_distribuicao_revenda": 1.08, "preco_medio_final": 6.14, "periodo": "Fallback estático"},
-            "gnv": {"parcela_petrobras": 2.40, "impostos_federais": 0.18, "icms": 1.20, "biocombustivel": 0.00, "margem_distribuicao_revenda": 0.90, "preco_medio_final": 4.68, "periodo": "Fallback estático"},
-            "glp": {"parcela_petrobras": 45.00, "impostos_federais": 3.50, "icms": 12.00, "biocombustivel": 0.00, "margem_distribuicao_revenda": 22.00, "preco_medio_final": 82.50, "periodo": "Fallback estático"},
+            "gasolina": {"parcela_petrobras": 2.06, "impostos_federais": 0.24, "icms": 1.57, "biocombustivel": 0.98, "margem_distribuicao_revenda": 1.51, "preco_medio_final": 6.36, "preco_medio_brasil": 6.55, "periodo": None},
+            "diesel":   {"parcela_petrobras": 2.81, "impostos_federais": 0.32, "icms": 1.17, "biocombustivel": 0.81, "margem_distribuicao_revenda": 2.17, "preco_medio_final": 7.29, "preco_medio_brasil": 7.35, "periodo": None},
+            "gnv":      {"parcela_petrobras": 2.40, "impostos_federais": 0.18, "icms": 1.20, "biocombustivel": 0.00, "margem_distribuicao_revenda": 0.90, "preco_medio_final": 4.68, "periodo": None},
+            "glp":      {"parcela_petrobras": 34.74, "impostos_federais": 0.00, "icms": 19.11, "biocombustivel": 0.00, "margem_distribuicao_revenda": 62.68, "preco_medio_final": 116.53, "preco_medio_brasil": 114.88, "periodo": None},
         }
-        dados = fallback.get(produto.lower(), fallback["gasolina"])
+        parcial = dados or {}
+        dados = dict(fallback.get(produto_lower, fallback["gasolina"]))
+        for k, v in parcial.items():
+            if k not in dados or not dados.get(k):
+                dados[k] = v
         dados["fonte"] = "fallback_estatico"
+        dados["aviso"] = "Não foi possível obter todos os componentes do scraping da Petrobras. Exibindo valores de referência."
     else:
         dados["fonte"] = "scraping_petrobras"
+        # GLP/GNV não têm biocombustível — normaliza para 0.0
+        if produto_lower in ("glp", "gnv"):
+            dados.setdefault("biocombustivel", 0.0)
+
+    if dados.get("periodo") in ("Fallback estático", "", None):
+        dados["periodo"] = None
 
     total = dados.get("preco_medio_final", 0)
-    if total > 0:
+    if total and total > 0:
         dados["percentuais"] = {
             "parcela_petrobras": round(dados.get("parcela_petrobras", 0) / total * 100, 1),
             "impostos_federais": round(dados.get("impostos_federais", 0) / total * 100, 1),
@@ -1337,7 +1399,83 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
         }
     return {"uf": uf, "produto": produto, **dados}
 
-# ======================== CACHE PETROBRAS EM DISCO ========================
+
+# ======================== ANP RESUMO ========================
+@app.get("/api/anp-resumo")
+def anp_resumo(uf: str, produto: str = "gasolina"):
+    """
+    Retorna min/média/máx da ANP **por estado (UF)**.
+    Este endpoint é intencionalmente separado do /api/precos para servir como
+    referência estadual — enquanto /api/precos mostra os preços do município.
+    """
+    uf_norm = normalizar_texto(uf)
+    produto_norm = produto.lower().strip()
+
+    caminho = obter_csv_mais_recente(produto_norm)
+    if not caminho:
+        return {"uf": uf, "produto": produto, "escopo": "estado", "erro": "CSV indisponível"}
+
+    try:
+        df = pd.read_csv(caminho, sep=";", encoding="latin1", decimal=",")
+        df.columns = [c.replace("ï»¿", "").strip() for c in df.columns]
+        cols = _detectar_colunas(df)
+        if not all([cols["municipio"], cols["uf"], cols["produto"], cols["valor"]]):
+            return {"uf": uf, "produto": produto, "escopo": "estado", "erro": "Colunas não detectadas"}
+
+        df["_uf_norm"] = df[cols["uf"]].astype(str).apply(normalizar_texto)
+        df["_produto_norm"] = df[cols["produto"]].astype(str).apply(normalizar_texto)
+
+        prod_alvo = produto_norm.upper()
+        if produto_norm == "gasolina":
+            mask = df["_produto_norm"] == "GASOLINA"
+        elif produto_norm == "etanol":
+            mask = df["_produto_norm"].str.contains("ETANOL", na=False)
+        elif produto_norm == "diesel":
+            mask = df["_produto_norm"].str.contains("DIESEL", na=False)
+        elif produto_norm == "gnv":
+            mask = df["_produto_norm"].str.contains("GNV", na=False)
+        elif produto_norm == "glp":
+            mask = df["_produto_norm"].str.contains("GLP", na=False)
+        else:
+            mask = df["_produto_norm"].str.contains(prod_alvo, na=False)
+
+        df_f = df[(df["_uf_norm"] == uf_norm) & mask]
+
+        precos = []
+        for v in df_f[cols["valor"]].tolist():
+            try:
+                p = float(str(v).replace(",", "."))
+                if validar_preco(produto_norm, p):
+                    precos.append(p)
+            except (ValueError, TypeError):
+                continue
+
+        if not precos:
+            return {"uf": uf, "produto": produto, "escopo": "estado", "erro": "Sem preços válidos"}
+
+        periodo = _extrair_data_referencia(df) or {}
+        if not periodo:
+            m = re.search(r"(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})", os.path.basename(caminho))
+            if m:
+                d, mo, y, h, mi = m.groups()
+                periodo = {"data_inicial": f"{d}/{mo}/{y}", "data_final": f"{d}/{mo}/{y}"}
+
+        return {
+            "uf": uf,
+            "produto": produto,
+            "escopo": "estado",   # ← ✅ NOVO: informa que o escopo é o estado inteiro
+            "minimo": round(min(precos), 2),
+            "media":  round(sum(precos) / len(precos), 2),
+            "maximo": round(max(precos), 2),
+            "total_postos": len(precos),
+            "periodo": periodo,
+            "fonte": "anp_csv",
+        }
+    except Exception as e:
+        print(f"❌ [ANP resumo] erro: {e}")
+        return {"uf": uf, "produto": produto, "escopo": "estado", "erro": str(e)}
+
+# ======================== CACHE PETROBRAS ========================
 @app.get("/api/petrobras-cache-info")
 def petrobras_cache_info():
     if not os.path.exists(CACHE_PETROBRAS_DIR):
@@ -1380,7 +1518,6 @@ def petrobras_cache_limpar():
 
 # ======================== ELETROPOSTOS ========================
 def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results: int = 500):
-    """✅ Faz a chamada à OCM e retorna a lista crua (ou [] em caso de erro)."""
     try:
         params = {
             "key": OCM_API_KEY, "output": "json",
@@ -1390,26 +1527,21 @@ def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results
         }
         r = _sessao.get(f"{OCM_BASE_URL}/poi/", params=params, timeout=45)
         if r.status_code != 200:
-            print(f"⚠️ [OCM] status {r.status_code}: {r.text[:150]}")
             return []
         try:
             return r.json()
         except ValueError:
-            print(f"⚠️ [OCM] resposta não-JSON: {r.text[:150]}")
             return []
     except Exception as e:
         print(f"⚠️ [OCM] erro de rede: {e}")
         return []
 
-
-def _formatar_eletroposto(item: dict, lat_origem: float = None, lon_origem: float = None) -> dict:
-    """✅ Converte um item cru da OCM no formato que o app espera."""
+def _formatar_eletroposto(item, lat_origem=None, lon_origem=None):
     endereco = item.get("AddressInfo") or {}
     conexoes = item.get("Connections") or []
     conexoes_formatadas = []
     custo_estimado_total = 0
     potencia_total = 0
-
     for c in conexoes[:5]:
         pot = c.get("PowerKW") or 0
         potencia_total += pot
@@ -1423,13 +1555,11 @@ def _formatar_eletroposto(item: dict, lat_origem: float = None, lon_origem: floa
             "preco_estimado_kwh": preco_estimado_kwh,
             "custo_estimado_30kwh": custo_sessao,
         })
-
     lat = endereco.get("Latitude")
     lon = endereco.get("Longitude")
     distancia = None
     if lat is not None and lon is not None and lat_origem is not None and lon_origem is not None:
         distancia = calcular_distancia_km(lat_origem, lon_origem, lat, lon)
-
     return {
         "id": item.get("ID"),
         "nome": endereco.get("Title"),
@@ -1447,115 +1577,49 @@ def _formatar_eletroposto(item: dict, lat_origem: float = None, lon_origem: floa
         "status": (item.get("StatusType") or {}).get("Title") if item.get("StatusType") else "Disponível",
     }
 
-
 @app.get("/api/eletropostos")
 def get_eletropostos(
-    latitude: float = Query(None, description="Latitude do centro da busca"),
-    longitude: float = Query(None, description="Longitude do centro da busca"),
-    municipio: str = Query(None, description="Nome do município (opcional, melhora o filtro)"),
-    uf: str = Query(None, description="UF (opcional)"),
-    raio_km: float = Query(ELETRO_RAIO_CIDADE_KM, description="Raio inicial em km"),
+    latitude: float = Query(None), longitude: float = Query(None),
+    municipio: str = Query(None), uf: str = Query(None),
+    raio_km: float = Query(ELETRO_RAIO_CIDADE_KM),
     max_resultados: int = Query(ELETRO_MAX_RESULTADOS),
 ):
-    """
-    ✅ Busca eletropostos com 3 camadas:
-    1. Tenta achar TODOS os eletropostos da cidade (filtro por Town + raio inicial).
-    2. Se não achar nenhum, expande o raio para ELETRO_RAIO_VIZINHAS_KM
-       e retorna os mais próximos das cidades vizinhas.
-    3. Se ainda não achar, usa ELETRO_RAIO_EMERGENCIA_KM (último recurso).
-    """
     if latitude is None or longitude is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Informe latitude e longitude. Ex: /api/eletropostos?latitude=-20.3155&longitude=-40.3128"
-        )
-
+        raise HTTPException(status_code=400, detail="Informe latitude e longitude.")
     if not OCM_API_KEY or OCM_API_KEY == "SUA_CHAVE_AQUI":
         raise HTTPException(status_code=500, detail="Configure a OCM_API_KEY.")
-
     municipio_norm = normalizar_texto(municipio) if municipio else None
-
-    # ═══════ Camada 1: cidade (raio inicial, filtro por Town) ═══════
-    print(f"\n⚡ [Eletropostos] camada 1: raio {raio_km} km em ({latitude}, {longitude})")
     itens = _buscar_eletropostos_ocm(latitude, longitude, raio_km, max_resultados)
-
     if municipio_norm:
-        itens_cidade = [
-            i for i in itens
-            if normalizar_texto((i.get("AddressInfo") or {}).get("Town") or "") == municipio_norm
-        ]
+        itens_cidade = [i for i in itens if normalizar_texto((i.get("AddressInfo") or {}).get("Town") or "") == municipio_norm]
     else:
         itens_cidade = itens
-
-    # Se achou na cidade, já formata e retorna
     if itens_cidade:
         formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_cidade]
         formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        print(f"✅ [Eletropostos] camada 1: {len(formatados)} eletropostos em {municipio or 'região'}")
-        return {
-            "total": len(formatados),
-            "modo_busca": "cidade",
-            "raio_usado_km": raio_km,
-            "municipio_filtrado": municipio,
-            "mensagem": f"{len(formatados)} eletropostos encontrados em {municipio or 'sua região'}",
-            "eletropostos": formatados,
-        }
-
-    # ═══════ Camada 2: cidades vizinhas (raio maior, sem filtro) ═══════
-    print(f"⚠️ [Eletropostos] camada 1 vazia. Expandindo para {ELETRO_RAIO_VIZINHAS_KM} km...")
-    itens_vizinhos = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_VIZINHAS_KM, max_resultados)
-
-    if itens_vizinhos:
-        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_vizinhos]
+        return {"total": len(formatados), "modo_busca": "cidade", "raio_usado_km": raio_km,
+                "municipio_filtrado": municipio,
+                "mensagem": f"{len(formatados)} eletropostos encontrados em {municipio or 'sua região'}",
+                "eletropostos": formatados}
+    itens_viz = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_VIZINHAS_KM, max_resultados)
+    if itens_viz:
+        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_viz]
         formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        cidades_vizinhas = sorted(set(
-            (e.get("cidade") or "Desconhecida")
-            for e in formatados[:20]
-        ))
-        print(f"✅ [Eletropostos] camada 2: {len(formatados)} eletropostos em cidades vizinhas")
-        return {
-            "total": len(formatados),
-            "modo_busca": "vizinhas",
-            "raio_usado_km": ELETRO_RAIO_VIZINHAS_KM,
-            "municipio_filtrado": municipio,
-            "cidades_encontradas": cidades_vizinhas,
-            "mensagem": f"Nenhum eletroposto em {municipio or 'sua cidade'}. "
-                        f"Mostrando os mais próximos em {', '.join(cidades_vizinhas[:3])}",
-            "eletropostos": formatados,
-        }
-
-    # ═══════ Camada 3: emergência (raio muito maior) ═══════
-    print(f"⚠️ [Eletropostos] camada 2 vazia. Expandindo para {ELETRO_RAIO_EMERGENCIA_KM} km...")
+        cidades = sorted(set((e.get("cidade") or "Desconhecida") for e in formatados[:20]))
+        return {"total": len(formatados), "modo_busca": "vizinhas", "raio_usado_km": ELETRO_RAIO_VIZINHAS_KM,
+                "municipio_filtrado": municipio, "cidades_encontradas": cidades,
+                "mensagem": f"Mostrando os mais próximos em {', '.join(cidades[:3])}", "eletropostos": formatados}
     itens_emerg = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_EMERGENCIA_KM, max_resultados)
-
     if itens_emerg:
         formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_emerg]
         formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        print(f"✅ [Eletropostos] camada 3: {len(formatados)} eletropostos em raio de emergência")
-        return {
-            "total": len(formatados),
-            "modo_busca": "emergencia",
-            "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
-            "municipio_filtrado": municipio,
-            "mensagem": f"Poucos eletropostos na região. Mostrando os mais próximos num raio de {ELETRO_RAIO_EMERGENCIA_KM} km",
-            "eletropostos": formatados,
-        }
-
-    # ═══════ Nada encontrado ═══════
-    print(f"❌ [Eletropostos] nenhum eletroposto num raio de {ELETRO_RAIO_EMERGENCIA_KM} km")
-    return {
-        "total": 0,
-        "modo_busca": "vazio",
-        "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
-        "municipio_filtrado": municipio,
-        "mensagem": f"Nenhum eletroposto num raio de {ELETRO_RAIO_EMERGENCIA_KM} km",
-        "eletropostos": [],
-    }
-
+        return {"total": len(formatados), "modo_busca": "emergencia", "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
+                "municipio_filtrado": municipio, "eletropostos": formatados}
+    return {"total": 0, "modo_busca": "vazio", "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
+            "municipio_filtrado": municipio, "eletropostos": []}
 
 @app.get("/api/eletropostos-cache-info")
 def eletropostos_cache_info():
-    """✅ Mostra quantos caches de eletropostos existem em disco."""
     if not os.path.exists(CACHE_ELETRO_DIR):
         return {"total": 0, "arquivos": []}
     arquivos = glob.glob(os.path.join(CACHE_ELETRO_DIR, "*.json"))

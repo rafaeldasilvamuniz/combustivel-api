@@ -1,0 +1,26 @@
+{
+  "_ts": 1791590955.0266316,
+  "produto": "gasolina",
+  "uf": "RJ",
+  "dados": {
+    "periodo": "27/09/2026 a 03/10/2026",
+    "preco_medio_final": 6.62,
+    "preco_medio_brasil": 6.55,
+    "margem_distribuicao_revenda": 1.72,
+    "biocombustivel": 0.98,
+    "icms": 1.57,
+    "impostos_federais": 0.24,
+    "parcela_petrobras": 2.11,
+    "uf_consultada": "RJ",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-gasolina-rj",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-gasolina-br",
+    "validacao_soma": {
+      "soma_componentes": 6.62,
+      "preco_final": 6.62,
+      "desvio_percentual": 0.0,
+      "consistente": true
+    },
+    "cache_origem": "scraping"
+  }
+}

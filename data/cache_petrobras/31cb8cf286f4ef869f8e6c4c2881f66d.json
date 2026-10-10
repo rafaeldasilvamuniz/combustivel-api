@@ -1,0 +1,26 @@
+{
+  "_ts": 1791593128.3531158,
+  "produto": "glp",
+  "uf": "SP",
+  "dados": {
+    "periodo": "27/09/2026 a 03/10/2026",
+    "preco_medio_final": 116.53,
+    "preco_medio_brasil": 114.88,
+    "margem_distribuicao_revenda": 62.68,
+    "icms": 19.11,
+    "impostos_federais": 0.0,
+    "parcela_petrobras": 34.74,
+    "uf_consultada": "SP",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-gas-de-cozinha-sp",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-gas-de-cozinha-br",
+    "biocombustivel": 0.0,
+    "validacao_soma": {
+      "soma_componentes": 116.53,
+      "preco_final": 116.53,
+      "desvio_percentual": 0.0,
+      "consistente": true
+    },
+    "cache_origem": "scraping"
+  }
+}

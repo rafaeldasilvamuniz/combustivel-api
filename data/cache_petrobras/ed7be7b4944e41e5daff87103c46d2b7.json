@@ -1,0 +1,19 @@
+{
+  "_ts": 1791831334.474073,
+  "produto": "glp",
+  "uf": "DF",
+  "dados": {
+    "preco_medio_brasil": 114.88,
+    "margem_distribuicao_revenda": 0.0,
+    "icms": 0.0,
+    "impostos_federais": 0.0,
+    "parcela_petrobras": 0.0,
+    "uf_consultada": "DF",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-gas-de-cozinha-df",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-gas-de-cozinha-br",
+    "periodo": "27/09/2026 a 03/10/2026",
+    "biocombustivel": 0.0,
+    "cache_origem": "scraping"
+  }
+}

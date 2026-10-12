@@ -1,0 +1,26 @@
+{
+  "_ts": 1791831374.8416193,
+  "produto": "diesel",
+  "uf": "DF",
+  "dados": {
+    "periodo": "27/09/2026 a 03/10/2026",
+    "preco_medio_final": 7.41,
+    "preco_medio_brasil": 7.35,
+    "margem_distribuicao_revenda": 2.19,
+    "biocombustivel": 0.82,
+    "icms": 1.17,
+    "impostos_federais": 0.32,
+    "parcela_petrobras": 2.91,
+    "uf_consultada": "DF",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-diesel-df",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-diesel-br",
+    "validacao_soma": {
+      "soma_componentes": 7.41,
+      "preco_final": 7.41,
+      "desvio_percentual": 0.0,
+      "consistente": true
+    },
+    "cache_origem": "scraping"
+  }
+}

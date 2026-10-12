@@ -1,0 +1,26 @@
+{
+  "_ts": 1791828422.1058378,
+  "produto": "gasolina",
+  "uf": "DF",
+  "dados": {
+    "periodo": "27/09/2026 a 03/10/2026",
+    "preco_medio_final": 6.66,
+    "preco_medio_brasil": 6.55,
+    "margem_distribuicao_revenda": 1.72,
+    "biocombustivel": 0.98,
+    "icms": 1.57,
+    "impostos_federais": 0.24,
+    "parcela_petrobras": 2.15,
+    "uf_consultada": "DF",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-gasolina-df",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-gasolina-br",
+    "validacao_soma": {
+      "soma_componentes": 6.66,
+      "preco_final": 6.66,
+      "desvio_percentual": 0.0,
+      "consistente": true
+    },
+    "cache_origem": "scraping"
+  }
+}

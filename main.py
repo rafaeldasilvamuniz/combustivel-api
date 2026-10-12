@@ -11,6 +11,7 @@ import glob
 import unicodedata
 import json
 import hashlib
+import subprocess
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -33,6 +34,9 @@ CACHE_ELETRO_DIR = os.path.join(CSV_DATA_DIR, "cache_eletropostos")
 
 OCM_API_KEY = "d75c2b4f-371d-4514-9f57-fbe8330538fa"
 OCM_BASE_URL = "https://api.openchargemap.io/v3"
+
+CARREGADOS_CLI = "npx -y @carregados/cli"
+CARREGADOS_TIMEOUT = 45
 
 ELETRO_RAIO_CIDADE_KM = 25
 ELETRO_RAIO_VIZINHAS_KM = 75
@@ -712,34 +716,31 @@ def get_precos(
     incluir_sem_preco: bool = Query(True),
     geocodificar_cep: bool = Query(True),
 ):
+    """
+    Retorna TODOS os postos autorizados pela ANP no município.
+    A fonte primária é o CSV de preços (que contém todos os CNPJs pesquisados).
+    A API de revendedores é usada para enriquecer com dados cadastrais.
+    Postos sem preço também são retornados.
+    """
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
     print(f"\n{'='*60}\n🔍 {municipio}/{uf} - produto: {produto or 'todos'}\n{'='*60}")
+
+    # 1. Busca postos da API (enriquecimento cadastral)
     postos_api = buscar_postos_anp_api(municipio, uf)
-    print(f"📋 Base ANP: {len(postos_api)} postos autorizados em {municipio}/{uf}")
-    if geocodificar_cep and postos_api:
-        postos_api = enriquecer_postos_sem_coordenada(postos_api, limite=40)
+    total_autorizados_api = len(postos_api)
+    print(f"📋 Base ANP (API): {total_autorizados_api} postos")
+
+    # 2. Garante CSVs atualizados
     garantir_todos_csvs(force_rebaixar_antigos=True)
     csvs_disponiveis = {p: obter_csv_mais_recente(p) for p in PRODUTOS}
-    if not any(csvs_disponiveis.values()):
-        if postos_api:
-            postos_sem_preco = []
-            for p in postos_api:
-                postos_sem_preco.append({**p, "cnpj": normalizar_cnpj(p["cnpj"]), "preco": 0.0, "tem_preco": False, "fonte_dado": "sem_csv"})
-            postos_sem_preco.sort(key=lambda p: normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or ""))
-            return {
-                "municipio": municipio, "uf": uf, "fonte_api_anp": len(postos_api),
-                "aviso": "CSVs de preços indisponíveis",
-                "produtos": {(produto or "gasolina").lower(): {
-                    "media": None, "minimo": None, "maximo": None,
-                    "total_postos": len(postos_sem_preco), "total_com_preco": 0,
-                    "total_sem_preco": len(postos_sem_preco), "fonte_dado": "sem_csv",
-                    "postos": postos_sem_preco,
-                }},
-            }
-        raise HTTPException(status_code=500, detail="Nenhum CSV disponível e nenhum posto na base ANP.")
+
+    # 3. Processa cada CSV
     try:
         resultados = {}
+        # Mapa global de CNPJs encontrados no CSV (para contar total de autorizados)
+        cnpjs_csv_global = set()
+
         for tipo_csv, caminho in csvs_disponiveis.items():
             if not caminho:
                 continue
@@ -755,14 +756,24 @@ def get_precos(
             cols = _detectar_colunas(df)
             if not all([cols["municipio"], cols["uf"], cols["produto"], cols["valor"]]):
                 continue
+
             df["_municipio_norm"] = df[cols["municipio"]].astype(str).apply(normalizar_texto)
             df["_uf_norm"] = df[cols["uf"]].astype(str).apply(normalizar_texto)
             df["_produto_norm"] = df[cols["produto"]].astype(str).apply(normalizar_texto)
+
             df_filtrado = df[(df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)]
             if df_filtrado.empty:
                 df_filtrado = df[(df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)]
             if df_filtrado.empty:
                 continue
+
+            # Registra CNPJs do CSV para contagem global
+            if cols["cnpj"]:
+                for c in df_filtrado[cols["cnpj"]].dropna().tolist():
+                    cnpj_limpo = normalizar_cnpj(c)
+                    if len(cnpj_limpo) == 14:
+                        cnpjs_csv_global.add(cnpj_limpo)
+
             mapeamento_produtos = [
                 ("GASOLINA ADITIVADA", "gasolina_aditivada"), ("GASOLINA", "gasolina"),
                 ("ETANOL HIDRATADO", "etanol"), ("ETANOL", "etanol"),
@@ -773,6 +784,7 @@ def get_precos(
             for prod_chave, prod_label in mapeamento_produtos:
                 if produto and prod_label != produto.lower():
                     continue
+
                 if prod_chave == "GASOLINA":
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA"]
                 elif prod_chave == "GASOLINA ADITIVADA":
@@ -785,8 +797,9 @@ def get_precos(
                     df_prod = df_filtrado[df_filtrado["_produto_norm"] == "DIESEL"]
                 else:
                     df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
+
+                # Mapa de preços por CNPJ (do CSV)
                 mapa_precos = {}
-                descartados_outlier = 0
                 if not df_prod.empty:
                     for _, row in df_prod.iterrows():
                         try:
@@ -794,70 +807,136 @@ def get_precos(
                         except (ValueError, TypeError):
                             continue
                         if not validar_preco(prod_label, preco):
-                            descartados_outlier += 1
                             continue
                         cnpj_limpo = normalizar_cnpj(row[cols["cnpj"]]) if cols["cnpj"] else ""
                         if not cnpj_limpo:
                             continue
+                        # Extrai dados cadastrais do CSV como fallback
+                        revenda_csv = str(row[cols["revenda"]]).strip() if cols["revenda"] else ""
+                        endereco_csv = str(row[cols["endereco"]]).strip() if cols["endereco"] else ""
+                        bairro_csv = str(row[cols["bairro"]]).strip() if cols["bairro"] else ""
+                        bandeira_csv = str(row[cols["bandeira"]]).strip() if cols["bandeira"] else ""
                         mapa_precos[cnpj_limpo] = {
                             "preco": round(preco, 2),
-                            "bandeira": str(row[cols["bandeira"]]) if cols["bandeira"] else "",
+                            "bandeira": bandeira_csv,
+                            "revenda": revenda_csv,
+                            "endereco": endereco_csv,
+                            "bairro": bairro_csv,
                         }
+
+                # Monta a lista COM TODOS os autorizados (API + CSV)
                 postos_merge = {}
+
+                # 3.1 Insere todos os postos da API
                 for p in postos_api:
                     cnpj_key = normalizar_cnpj(p["cnpj"])
                     postos_merge[cnpj_key] = {
-                        **p, "cnpj": cnpj_key, "preco": 0.0, "tem_preco": False,
-                        "produto": prod_label.upper(), "cnpj_orfao": False, "fonte_dado": fonte_dado,
+                        **p,
+                        "cnpj": cnpj_key,
+                        "preco": 0.0,
+                        "tem_preco": False,
+                        "produto": prod_label.upper(),
+                        "cnpj_orfao": False,
+                        "fonte_dado": "sem_preco_anp",
+                        "autorizado_anp": True,
                     }
+
+                # 3.2 Aplica preços do CSV nos autorizados; insere os que faltam
                 for cnpj_limpo, dados_preco in mapa_precos.items():
                     if cnpj_limpo in postos_merge:
                         postos_merge[cnpj_limpo]["preco"] = dados_preco["preco"]
                         postos_merge[cnpj_limpo]["tem_preco"] = True
+                        postos_merge[cnpj_limpo]["fonte_dado"] = fonte_dado
                         if dados_preco["bandeira"]:
                             postos_merge[cnpj_limpo]["bandeira"] = dados_preco["bandeira"]
                     else:
+                        # Posto do CSV que não está na API → insere com dados do CSV
                         postos_merge[cnpj_limpo] = {
-                            "cnpj": cnpj_limpo, "revenda": f"Posto {cnpj_limpo}",
-                            "endereco": "Endereço não disponível na base ANP", "bairro": "",
-                            "municipio": municipio, "uf": uf, "cep": "",
-                            "bandeira": dados_preco["bandeira"], "preco": dados_preco["preco"],
-                            "tem_preco": True, "produto": prod_label.upper(),
-                            "latitude": None, "longitude": None,
-                            "aviso": "Endereço não disponível na base ANP",
-                            "cnpj_orfao": True, "fonte_dado": fonte_dado,
+                            "cnpj": cnpj_limpo,
+                            "revenda": dados_preco.get("revenda") or f"Posto {cnpj_limpo}",
+                            "nome_fantasia": dados_preco.get("revenda") or "",
+                            "endereco": dados_preco.get("endereco") or "Endereço não disponível",
+                            "bairro": dados_preco.get("bairro") or "",
+                            "municipio": municipio,
+                            "uf": uf,
+                            "cep": "",
+                            "bandeira": dados_preco.get("bandeira") or "",
+                            "preco": dados_preco["preco"],
+                            "tem_preco": True,
+                            "produto": prod_label.upper(),
+                            "latitude": None,
+                            "longitude": None,
+                            "cnpj_orfao": True,
+                            "fonte_dado": fonte_dado,
+                            "autorizado_anp": True,  # Consideramos autorizado (está no CSV)
                         }
+
                 postos_lista = list(postos_merge.values())
-                precos_validos = [p["preco"] for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0]
+
                 if not incluir_sem_preco:
-                    postos_lista = [p for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0]
+                    postos_lista = [p for p in postos_lista if p["preco"] > 0]
+
                 if not postos_lista:
                     continue
+
+                # Geocodifica postos sem coordenada
+                if geocodificar_cep:
+                    postos_lista = enriquecer_postos_sem_coordenada(postos_lista, limite=60)
+
+                # Estatísticas
+                precos_validos = [p["preco"] for p in postos_lista if p["preco"] > 0]
                 if precos_validos:
                     media = round(sum(precos_validos) / len(precos_validos), 2)
                     minimo = round(min(precos_validos), 2)
                     maximo = round(max(precos_validos), 2)
                 else:
                     media = minimo = maximo = None
+
+                # Ordena: com preço primeiro (menor para maior), depois sem preço
                 postos_lista.sort(key=lambda p: (
-                    0 if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 1,
-                    p["preco"] if (isinstance(p.get("preco"), (int, float)) and p["preco"] > 0) else 9999,
+                    0 if p["preco"] > 0 else 1,
+                    p["preco"] if p["preco"] > 0 else 9999,
                     normalizar_texto(p.get("revenda") or p.get("nome_fantasia") or ""),
                 ))
-                com_preco = sum(1 for p in postos_lista if isinstance(p.get("preco"), (int, float)) and p["preco"] > 0)
+
+                com_preco = sum(1 for p in postos_lista if p["preco"] > 0)
                 sem_preco = len(postos_lista) - com_preco
-                orfaos = sum(1 for p in postos_lista if p.get("cnpj_orfao"))
+                autorizados = sum(1 for p in postos_lista if p.get("autorizado_anp"))
+
                 if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
                     resultados[prod_label] = {
                         "media": media, "minimo": minimo, "maximo": maximo,
-                        "total_postos": len(postos_lista), "total_com_preco": com_preco,
-                        "total_sem_preco": sem_preco, "total_cnpj_orfao": orfaos,
-                        "fonte_dado": fonte_dado, "data_referencia": data_ref,
+                        "total_postos": len(postos_lista),
+                        "total_com_preco": com_preco,
+                        "total_sem_preco": sem_preco,
+                        "total_autorizados_anp": autorizados,
+                        "fonte_dado": fonte_dado,
+                        "data_referencia": data_ref,
                         "postos": postos_lista,
                     }
+
         if not resultados:
-            return {"erro": "Nenhum posto encontrado", "municipio": municipio, "uf": uf, "produtos": {}, "fonte_api_anp": len(postos_api)}
-        return {"municipio": municipio, "uf": uf, "fonte_api_anp": len(postos_api), "produtos": resultados}
+            return {
+                "erro": "Nenhum posto encontrado",
+                "municipio": municipio,
+                "uf": uf,
+                "produtos": {},
+                "fonte_api_anp": total_autorizados_api,
+                "total_autorizados_anp": 0,
+            }
+
+        # Total de autorizados = união dos CNPJs da API + CSV
+        cnpjs_api = set(normalizar_cnpj(p["cnpj"]) for p in postos_api if normalizar_cnpj(p["cnpj"]))
+        cnpjs_todos = cnpjs_api | cnpjs_csv_global
+        total_autorizados_final = len(cnpjs_todos)
+
+        return {
+            "municipio": municipio,
+            "uf": uf,
+            "fonte_api_anp": total_autorizados_api,
+            "total_autorizados_anp": total_autorizados_final,
+            "produtos": resultados,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -938,6 +1017,7 @@ def status_dados():
             "intervalo_horas": INTERVALO_VERIFICACAO_HORAS,
             "rodando": scheduler.running if 'scheduler' in globals() else False,
         },
+        "carregados_configurado": True,
     }
     for produto in PRODUTOS:
         caminho = obter_csv_mais_recente(produto)
@@ -975,7 +1055,6 @@ PETROBRAS_SLUG = {
     "gnv":      "gnv",
 }
 
-# ✅ Componentes obrigatórios POR PRODUTO (GLP/GNV não têm biocombustível)
 COMPONENTES_POR_PRODUTO = {
     "gasolina": ["parcela_petrobras", "impostos_federais", "icms",
                  "biocombustivel", "margem_distribuicao_revenda"],
@@ -990,11 +1069,9 @@ COMPONENTES_POR_PRODUTO = {
 def _componentes_obrigatorios(produto: str) -> list:
     return COMPONENTES_POR_PRODUTO.get(produto.lower(), COMPONENTES_POR_PRODUTO["gasolina"])
 
-# Mantém o nome antigo para compatibilidade, mas agora é uma lista genérica
 COMPONENTES_OBRIGATORIOS = COMPONENTES_POR_PRODUTO["gasolina"]
 
 def _parse_valor_brl(txt: str):
-    """Extrai valor R$ X,XX de um texto."""
     if not txt:
         return None
     m = re.search(r"R\$\s*([\d.]+,\d{2}|\d+,\d{2}|\d+\.\d{2})", txt)
@@ -1006,50 +1083,22 @@ def _parse_valor_brl(txt: str):
     except ValueError:
         return None
 
-
 def _parse_numero_simples(txt: str):
-    """Aceita '1,51' ou '1.51' como float."""
     if not txt:
         return None
     txt = str(txt).strip()
-    # Tenta formato brasileiro primeiro
     m = re.match(r"^(\d{1,3}(?:\.\d{3})*,\d{1,2}|\d+,\d{1,2})$", txt)
     if m:
         try:
             return float(txt.replace(".", "").replace(",", "."))
         except ValueError:
             pass
-    # Tenta formato decimal internacional
     try:
         return float(txt.replace(",", "."))
     except ValueError:
         return None
 
-
 def _scrape_petrobras_pagina(url: str):
-    """
-    Raspa a página da Petrobras.
-
-    ✅ Padrão REAL observado no HTML (confirmado via /api/debug-petrobras):
-        [idx 116] "R$"
-        [idx 117] "1,51"
-        [idx 118] "Distribuicão e Revenda"
-        [idx 122] "R$"
-        [idx 123] "0,98"
-        [idx 124] "Custo Etanol Anidro"
-        [idx 128] "R$"
-        [idx 129] "1,57"
-        [idx 130] "Imposto Estadual"
-        [idx 134] "R$"
-        [idx 135] "0,24"
-        [idx 136] "Impostos Federais"
-        [idx 140] "R$"
-        [idx 141] "2,06"
-        [idx 142] "Parcela Petrobras"
-
-    Ou seja: R$ + número vêm ANTES do rótulo, e o rótulo vem logo depois (idx +2).
-    Estratégia: para cada rótulo, buscar o valor nas ~3 linhas ANTES dele.
-    """
     try:
         r = _sessao.get(url, timeout=25, allow_redirects=True)
         if r.status_code != 200:
@@ -1061,17 +1110,14 @@ def _scrape_petrobras_pagina(url: str):
         linhas = [l.strip() for l in texto.split("\n") if l.strip()]
         dados = {}
 
-        # ─── 1. Período ───
         for l in linhas:
             m = re.search(r"(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})", l)
             if m:
                 dados["periodo"] = f"{m.group(1)} a {m.group(2)}"
                 break
 
-        # ─── 2. Preço médio (do estado) ───
         for i, l in enumerate(linhas):
             if "preço médio" in l.lower() and "brasil" not in l.lower():
-                # valor costuma estar 1-3 linhas depois
                 for j in range(i, min(len(linhas), i + 5)):
                     v = _parse_numero_simples(linhas[j])
                     if v is not None and 0.5 < v < 500:
@@ -1080,7 +1126,6 @@ def _scrape_petrobras_pagina(url: str):
                 if "preco_medio_final" in dados:
                     break
 
-        # ─── 3. Preço médio do Brasil ───
         for i, l in enumerate(linhas):
             if "preço médio do brasil" in l.lower():
                 for j in range(i, min(len(linhas), i + 4)):
@@ -1088,14 +1133,12 @@ def _scrape_petrobras_pagina(url: str):
                     if v is not None and 0.5 < v < 500:
                         dados["preco_medio_brasil"] = round(v, 2)
                         break
-                # também pega "R$ 6,55" na mesma linha
                 if "preco_medio_brasil" not in dados:
                     v = _parse_valor_brl(l)
                     if v is not None and 0.5 < v < 500:
                         dados["preco_medio_brasil"] = round(v, 2)
                 break
 
-        # ─── 4. Componentes: buscar valor ANTES do rótulo ───
         rotulos = {
             "parcela petrobras": "parcela_petrobras",
             "parcela da petrobras": "parcela_petrobras",
@@ -1114,14 +1157,12 @@ def _scrape_petrobras_pagina(url: str):
             "margem de distribuição": "margem_distribuicao_revenda",
         }
 
-        # Marcador de início da seção visual (evita pegar o texto explicativo)
         idx_inicio_visual = 0
         for i, l in enumerate(linhas):
             if "preço médio" in l.lower() and (">" in l or ":" in l):
                 idx_inicio_visual = i
                 break
 
-        # Constrói lista de valores (R$ + número) com suas posições
         valores_com_pos = []
         for i, l in enumerate(linhas):
             if l.strip() in ("R$", "R$:"):
@@ -1134,7 +1175,6 @@ def _scrape_petrobras_pagina(url: str):
                 if v is not None and 0 <= v < 500:
                     valores_com_pos.append((i, v))
 
-        # Para cada rótulo, pega o valor imediatamente ANTES dele (nas últimas 6 linhas)
         for i, l in enumerate(linhas):
             if i < idx_inicio_visual:
                 continue
@@ -1156,7 +1196,6 @@ def _scrape_petrobras_pagina(url: str):
                         dados[campo] = round(melhor_valor, 2)
                     break
 
-        # ─── 5. Fallback regex no HTML bruto (JSON embutido) ───
         if len(dados) < len(COMPONENTES_OBRIGATORIOS) + 1:
             html_text = r.text
             regexes = {
@@ -1201,10 +1240,8 @@ def _scrape_petrobras_pagina(url: str):
         print(f"⚠️ [Petrobras] erro em {url}: {e}")
         return None
 
-
 @app.get("/api/debug-petrobras")
 def debug_petrobras(uf: str = "SP", produto: str = "gasolina"):
-    """Endpoint de debug: mostra tudo que o scraping extraiu e as linhas cruas."""
     slug = PETROBRAS_SLUG.get(produto.lower())
     if not slug:
         raise HTTPException(status_code=400, detail="Produto inválido")
@@ -1227,13 +1264,12 @@ def debug_petrobras(uf: str = "SP", produto: str = "gasolina"):
                 for i, l in enumerate(linhas)
                 if any(k in normalizar_texto(l).lower() for k in [
                     "parcela", "imposto", "icms", "etanol", "biodiesel",
-                    "distribui", "revenda", "preço médio", "preco medio",
+                    "distribu", "revenda", "preço médio", "preco medio",
                 ]) or l.strip() == "R$"
             ][:80],
         }
     except Exception as e:
         return {"erro": str(e), "url": url}
-
 
 def _urls_petrobras(produto: str, uf: str):
     slug = PETROBRAS_SLUG.get(produto)
@@ -1241,7 +1277,6 @@ def _urls_petrobras(produto: str, uf: str):
         return []
     uf_l = (uf or "br").lower()
     return [f"https://precos.petrobras.com.br/w/preco-{slug}-{uf_l}"]
-
 
 def _scrape_petrobras_completo(produto: str, uf: str):
     candidatas = _urls_petrobras(produto, uf)
@@ -1263,7 +1298,6 @@ def _scrape_petrobras_completo(produto: str, uf: str):
     if melhor:
         print(f"⚠️ [Petrobras] melhor resultado teve {melhor_score}/{len(obrigatorios)} componentes: {melhor_url}")
     return melhor, melhor_url
-
 
 def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
     uf_norm = (uf or "BR").upper().strip()
@@ -1321,17 +1355,14 @@ def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
     if url_brasil_usada:
         dados["url_brasil"] = url_brasil_usada
 
-    # Sempre tenta preencher preco_medio_brasil separado
     if dados_brasil and "preco_medio_final" in dados_brasil and "preco_medio_brasil" not in dados:
         dados["preco_medio_brasil"] = dados_brasil["preco_medio_final"]
     if dados_brasil and "periodo" in dados_brasil and "periodo" not in dados:
         dados["periodo"] = dados_brasil["periodo"]
 
-    # ✅ GLP/GNV não têm biocombustível — normaliza para 0.0
     if produto_norm in ("glp", "gnv"):
         dados.setdefault("biocombustivel", 0.0)
 
-    # Validação da soma
     if all(c in dados for c in obrigatorios) and "preco_medio_final" in dados:
         soma = sum(dados.get(c, 0) for c in obrigatorios)
         final = dados["preco_medio_final"]
@@ -1355,7 +1386,6 @@ def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
         print(f"⚠️ [Petrobras] scraping incompleto (faltam {faltando}) — não gravando cache")
 
     return dados
-
 
 @app.get("/api/composicao")
 def get_composicao(uf: str = "BR", produto: str = "gasolina"):
@@ -1381,7 +1411,6 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
         dados["aviso"] = "Não foi possível obter todos os componentes do scraping da Petrobras. Exibindo valores de referência."
     else:
         dados["fonte"] = "scraping_petrobras"
-        # GLP/GNV não têm biocombustível — normaliza para 0.0
         if produto_lower in ("glp", "gnv"):
             dados.setdefault("biocombustivel", 0.0)
 
@@ -1399,15 +1428,9 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
         }
     return {"uf": uf, "produto": produto, **dados}
 
-
 # ======================== ANP RESUMO ========================
 @app.get("/api/anp-resumo")
 def anp_resumo(uf: str, produto: str = "gasolina"):
-    """
-    Retorna min/média/máx da ANP **por estado (UF)**.
-    Este endpoint é intencionalmente separado do /api/precos para servir como
-    referência estadual — enquanto /api/precos mostra os preços do município.
-    """
     uf_norm = normalizar_texto(uf)
     produto_norm = produto.lower().strip()
 
@@ -1463,7 +1486,7 @@ def anp_resumo(uf: str, produto: str = "gasolina"):
         return {
             "uf": uf,
             "produto": produto,
-            "escopo": "estado",   # ← ✅ NOVO: informa que o escopo é o estado inteiro
+            "escopo": "estado",
             "minimo": round(min(precos), 2),
             "media":  round(sum(precos) / len(precos), 2),
             "maximo": round(max(precos), 2),
@@ -1516,8 +1539,9 @@ def petrobras_cache_limpar():
     PETROBRAS_CACHE.clear()
     return {"status": "ok", "total_apagados": apagados}
 
-# ======================== ELETROPOSTOS ========================
+# ======================== ELETROPOSTOS (OCM + Carregados) ========================
 def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results: int = 500):
+    """OCM — API pública, gratuita, sem token obrigatório. Fonte principal."""
     try:
         params = {
             "key": OCM_API_KEY, "output": "json",
@@ -1536,7 +1560,42 @@ def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results
         print(f"⚠️ [OCM] erro de rede: {e}")
         return []
 
-def _formatar_eletroposto(item, lat_origem=None, lon_origem=None):
+def _buscar_eletropostos_carregados(lat: float, lon: float, raio_km: float):
+    """Carregados CLI — consulta por coordenada não suportada. Retorna []."""
+    print("ℹ️ [Carregados] consulta por coordenada não suportada. Pulando.")
+    return []
+
+def _buscar_eletropostos_carregados_por_cidade(municipio: str, uf: str):
+    """Busca eletropostos do Carregados CLI filtrando por cidade e estado."""
+    if not municipio or not uf:
+        return []
+    try:
+        cmd = f'{CARREGADOS_CLI} stations search --estado "{uf}" --cidade "{municipio}" --json'
+        print(f"🌐 [Carregados] executando: {cmd}")
+        resultado = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=CARREGADOS_TIMEOUT
+        )
+        if resultado.returncode != 0:
+            print(f"⚠️ [Carregados] erro na execução: {resultado.stderr[:300]}")
+            return []
+        saida = resultado.stdout.strip()
+        if not saida:
+            return []
+        dados = json.loads(saida)
+        itens = dados if isinstance(dados, list) else dados.get("stations") or dados.get("data") or []
+        print(f"✅ [Carregados] {len(itens)} estações recebidas")
+        return itens
+    except subprocess.TimeoutExpired:
+        print("❌ [Carregados] timeout na execução do CLI")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"❌ [Carregados] erro ao parsear JSON: {e}")
+        return []
+    except Exception as e:
+        print(f"❌ [Carregados] erro: {e}")
+        return []
+
+def _formatar_eletroposto_ocm(item, lat_origem=None, lon_origem=None):
     endereco = item.get("AddressInfo") or {}
     conexoes = item.get("Connections") or []
     conexoes_formatadas = []
@@ -1575,7 +1634,64 @@ def _formatar_eletroposto(item, lat_origem=None, lon_origem=None):
         "custo_estimado_sessao": round(custo_estimado_total, 2) if conexoes_formatadas else 0,
         "observacao_custo": "Estimativa baseada em tarifas médias: R$1,50/kWh (AC) e R$2,50/kWh (DC), sessão média de 30 kWh",
         "status": (item.get("StatusType") or {}).get("Title") if item.get("StatusType") else "Disponível",
+        "fonte": "openchargemap"
     }
+
+def _formatar_eletroposto_carregados(item, lat_origem=None, lon_origem=None):
+    lat = item.get("latitude") or item.get("lat")
+    lon = item.get("longitude") or item.get("lng") or item.get("lon")
+    distancia = None
+    if lat is not None and lon is not None and lat_origem is not None and lon_origem is not None:
+        distancia = calcular_distancia_km(lat_origem, lon_origem, lat, lon)
+    conexoes = []
+    for c in (item.get("chargers") or item.get("connectors") or []):
+        pot = c.get("power_kw") or c.get("power") or 0
+        conexoes.append({
+            "tipo": c.get("type") or c.get("connector_type") or "N/A",
+            "potencia_kw": pot,
+            "quantidade": c.get("quantity", 1),
+            "preco_estimado_kwh": 2.50 if pot >= 22 else 1.50,
+            "custo_estimado_30kwh": round((2.50 if pot >= 22 else 1.50) * 30, 2),
+        })
+    if not conexoes:
+        conexoes.append({
+            "tipo": "N/A", "potencia_kw": 7, "quantidade": 1,
+            "preco_estimado_kwh": 1.50, "custo_estimado_30kwh": 45.00,
+        })
+    return {
+        "id": item.get("id"),
+        "nome": item.get("name"),
+        "endereco": item.get("address"),
+        "cidade": item.get("city"),
+        "uf": item.get("state"),
+        "latitude": lat,
+        "longitude": lon,
+        "distancia_km": distancia,
+        "operador": item.get("operator") or "Não informado",
+        "conexoes": conexoes,
+        "potencia_total_kw": max([c["potencia_kw"] for c in conexoes], default=0),
+        "custo_estimado_sessao": sum(c["custo_estimado_30kwh"] for c in conexoes),
+        "observacao_custo": "Dados do Carregados (estimativa de custo baseada em tarifas médias)",
+        "status": "Disponível",
+        "fonte": "carregados"
+    }
+
+def _fundir_eletropostos(ocm_lista: list, carregados_lista: list) -> list:
+    """Funde OCM + Carregados, removendo duplicatas por coordenada (~100m). Carregados tem prioridade."""
+    unicos = {}
+    for est in carregados_lista:
+        if est.get("latitude") and est.get("longitude"):
+            chave = (round(est["latitude"], 3), round(est["longitude"], 3))
+            if chave not in unicos:
+                unicos[chave] = est
+    for est in ocm_lista:
+        if est.get("latitude") and est.get("longitude"):
+            chave = (round(est["latitude"], 3), round(est["longitude"], 3))
+            if chave not in unicos:
+                unicos[chave] = est
+    resultado = list(unicos.values())
+    resultado.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
+    return resultado
 
 @app.get("/api/eletropostos")
 def get_eletropostos(
@@ -1586,37 +1702,44 @@ def get_eletropostos(
 ):
     if latitude is None or longitude is None:
         raise HTTPException(status_code=400, detail="Informe latitude e longitude.")
-    if not OCM_API_KEY or OCM_API_KEY == "SUA_CHAVE_AQUI":
-        raise HTTPException(status_code=500, detail="Configure a OCM_API_KEY.")
     municipio_norm = normalizar_texto(municipio) if municipio else None
-    itens = _buscar_eletropostos_ocm(latitude, longitude, raio_km, max_resultados)
-    if municipio_norm:
-        itens_cidade = [i for i in itens if normalizar_texto((i.get("AddressInfo") or {}).get("Town") or "") == municipio_norm]
-    else:
-        itens_cidade = itens
-    if itens_cidade:
-        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_cidade]
-        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        return {"total": len(formatados), "modo_busca": "cidade", "raio_usado_km": raio_km,
-                "municipio_filtrado": municipio,
-                "mensagem": f"{len(formatados)} eletropostos encontrados em {municipio or 'sua região'}",
-                "eletropostos": formatados}
-    itens_viz = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_VIZINHAS_KM, max_resultados)
-    if itens_viz:
-        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_viz]
-        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        cidades = sorted(set((e.get("cidade") or "Desconhecida") for e in formatados[:20]))
-        return {"total": len(formatados), "modo_busca": "vizinhas", "raio_usado_km": ELETRO_RAIO_VIZINHAS_KM,
-                "municipio_filtrado": municipio, "cidades_encontradas": cidades,
-                "mensagem": f"Mostrando os mais próximos em {', '.join(cidades[:3])}", "eletropostos": formatados}
-    itens_emerg = _buscar_eletropostos_ocm(latitude, longitude, ELETRO_RAIO_EMERGENCIA_KM, max_resultados)
-    if itens_emerg:
-        formatados = [_formatar_eletroposto(i, latitude, longitude) for i in itens_emerg]
-        formatados.sort(key=lambda x: x.get("distancia_km") if x.get("distancia_km") is not None else 999999)
-        return {"total": len(formatados), "modo_busca": "emergencia", "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
-                "municipio_filtrado": municipio, "eletropostos": formatados}
-    return {"total": 0, "modo_busca": "vazio", "raio_usado_km": ELETRO_RAIO_EMERGENCIA_KM,
-            "municipio_filtrado": municipio, "eletropostos": []}
+
+    ocm_itens = _buscar_eletropostos_ocm(latitude, longitude, raio_km, max_resultados)
+    ocm_formatados = [_formatar_eletroposto_ocm(i, latitude, longitude) for i in ocm_itens]
+
+    carregados_itens = []
+    if municipio and uf:
+        carregados_itens = _buscar_eletropostos_carregados_por_cidade(municipio, uf)
+    carregados_formatados = [_formatar_eletroposto_carregados(i, latitude, longitude) for i in carregados_itens]
+
+    todos = _fundir_eletropostos(ocm_formatados, carregados_formatados)
+
+    if municipio_norm and raio_km < 50:
+        filtrados = []
+        for est in todos:
+            cidade_est = normalizar_texto(est.get("cidade") or "")
+            if cidade_est == municipio_norm or est.get("fonte") == "carregados":
+                filtrados.append(est)
+        if filtrados:
+            todos = filtrados
+
+    if not todos:
+        return {"total": 0, "modo_busca": "vazio", "raio_usado_km": raio_km,
+                "municipio_filtrado": municipio, "eletropostos": []}
+
+    total_ocm = sum(1 for e in todos if e.get("fonte") == "openchargemap")
+    total_carregados = sum(1 for e in todos if e.get("fonte") == "carregados")
+
+    return {
+        "total": len(todos),
+        "total_ocm": total_ocm,
+        "total_carregados": total_carregados,
+        "modo_busca": "fusao",
+        "raio_usado_km": raio_km,
+        "municipio_filtrado": municipio,
+        "mensagem": f"{len(todos)} eletropostos (OCM: {total_ocm}, Carregados: {total_carregados})",
+        "eletropostos": todos,
+    }
 
 @app.get("/api/eletropostos-cache-info")
 def eletropostos_cache_info():
@@ -1661,6 +1784,7 @@ scheduler.add_job(
 def iniciar_agendador():
     scheduler.start()
     print(f"⏰ Agendador iniciado (intervalo: {INTERVALO_VERIFICACAO_HORAS}h).")
+    print("✅ [Eletropostos] Fontes: Open Charge Map (principal) + Carregados CLI (complementar)")
     try:
         garantir_todos_csvs(force_rebaixar_antigos=True)
     except Exception as e:

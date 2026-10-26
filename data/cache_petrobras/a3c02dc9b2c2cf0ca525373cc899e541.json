@@ -1,0 +1,26 @@
+{
+  "_ts": 1793013687.9851873,
+  "produto": "gasolina",
+  "uf": "ES",
+  "dados": {
+    "periodo": "11/10/2026 a 17/10/2026",
+    "preco_medio_final": 6.43,
+    "preco_medio_brasil": 6.53,
+    "margem_distribuicao_revenda": 1.76,
+    "biocombustivel": 0.99,
+    "icms": 1.57,
+    "impostos_federais": 0.06,
+    "parcela_petrobras": 2.06,
+    "uf_consultada": "ES",
+    "origem_uf": "estado",
+    "url_estado": "https://precos.petrobras.com.br/w/preco-gasolina-es",
+    "url_brasil": "https://precos.petrobras.com.br/w/preco-gasolina-br",
+    "validacao_soma": {
+      "soma_componentes": 6.44,
+      "preco_final": 6.43,
+      "desvio_percentual": 0.16,
+      "consistente": true
+    },
+    "cache_origem": "scraping"
+  }
+}

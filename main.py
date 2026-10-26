@@ -8,6 +8,8 @@ import os
 import re
 import time
 import glob
+import socket
+import threading
 import unicodedata
 import json
 import hashlib
@@ -52,9 +54,19 @@ IDADE_MAXIMA_CSV_DIAS = 1
 
 API_ANP_REVENDEDORES = "https://revendedoresapi.anp.gov.br/v1/combustivel"
 API_CACHE_TTL_HORAS = 24
+API_ANP_PAGE_SIZE = 100
+API_ANP_MAX_PAGINAS = 50
 
 BRASILAPI_CEP_URL = "https://brasilapi.com.br/api/cep/v2/{cep}"
 CEP_CACHE_TTL_DIAS = 90
+
+TIMEOUT_CONECTIVIDADE = 1.5
+TIMEOUT_DOWNLOAD_CSV = 15
+TIMEOUT_API_ANP = 25
+TIMEOUT_CEP = 8
+TIMEOUT_PETROBRAS = 20
+
+ONLINE_CACHE_TTL = 5.0
 
 PRODUTOS = ["gasolina", "etanol", "diesel", "gnv", "glp"]
 
@@ -115,6 +127,40 @@ def normalizar_cnpj(cnpj) -> str:
     if not cnpj:
         return ""
     return re.sub(r"\D", "", str(cnpj))
+
+def _normalizar_municipio_api(m: str) -> str:
+    """API ANP exige município SEM caracteres especiais (sem acento)."""
+    return normalizar_texto(m)
+
+_online_cache = {"valor": None, "ts": 0.0}
+
+def esta_online(timeout: float = TIMEOUT_CONECTIVIDADE, forcar: bool = False) -> bool:
+    """
+    Verifica conectividade TCP. Cacheado por ONLINE_CACHE_TTL segundos
+    para evitar múltiplas conexões dentro do mesmo request.
+    """
+    global _online_cache
+    agora = time.time()
+    if not forcar and _online_cache["valor"] is not None:
+        if (agora - _online_cache["ts"]) < ONLINE_CACHE_TTL:
+            return _online_cache["valor"]
+    try:
+        s = socket.create_connection(("1.1.1.1", 443), timeout=timeout)
+        s.close()
+        _online_cache["valor"] = True
+        _online_cache["ts"] = agora
+        return True
+    except OSError:
+        try:
+            s = socket.create_connection(("8.8.8.8", 53), timeout=timeout)
+            s.close()
+            _online_cache["valor"] = True
+            _online_cache["ts"] = agora
+            return True
+        except OSError:
+            _online_cache["valor"] = False
+            _online_cache["ts"] = agora
+            return False
 
 def _api_cache_path(municipio: str, uf: str) -> str:
     chave = f"{normalizar_texto(municipio)}_{normalizar_texto(uf)}"
@@ -188,19 +234,29 @@ def geocodificar_por_cep(cep: str) -> dict:
     if len(cep_limpo) != 8:
         return None
     cache_file = _cep_cache_path(cep_limpo)
+
+    cached_payload = None
     if os.path.exists(cache_file):
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if time.time() - cached.get("_ts", 0) < CEP_CACHE_TTL_DIAS * 86400:
+            fresco = (time.time() - cached.get("_ts", 0)) < CEP_CACHE_TTL_DIAS * 86400
+            if fresco or not esta_online():
+                cached_payload = cached
                 if cached.get("latitude") and cached.get("longitude"):
-                    return {"latitude": cached["latitude"], "longitude": cached["longitude"], "fonte": "brasilapi_cep"}
-                return None
+                    return {"latitude": cached["latitude"], "longitude": cached["longitude"],
+                            "fonte": "brasilapi_cep"}
+                if fresco:
+                    return None
         except Exception:
             pass
+
+    if not esta_online():
+        return None
+
     try:
         url = BRASILAPI_CEP_URL.format(cep=cep_limpo)
-        r = _sessao.get(url, timeout=10)
+        r = requests.get(url, headers=HEADERS_NAVEGADOR, timeout=TIMEOUT_CEP)
         if r.status_code == 404:
             try:
                 with open(cache_file, "w", encoding="utf-8") as f:
@@ -236,6 +292,9 @@ def geocodificar_por_cep(cep: str) -> dict:
         return None
     except Exception as e:
         print(f"⚠️ [CEP] erro geocodificando {cep_limpo}: {e}")
+        if cached_payload and cached_payload.get("latitude") and cached_payload.get("longitude"):
+            return {"latitude": cached_payload["latitude"], "longitude": cached_payload["longitude"],
+                    "fonte": "brasilapi_cep"}
         return None
 
 def enriquecer_postos_sem_coordenada(postos: list, limite: int = 40) -> list:
@@ -256,67 +315,11 @@ def enriquecer_postos_sem_coordenada(postos: list, limite: int = 40) -> list:
     return postos
 
 # ======================== API ANP (cadastro) ========================
-def buscar_postos_anp_api(municipio: str, uf: str) -> list:
-    cache_file = _api_cache_path(municipio, uf)
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if time.time() - cached.get("_ts", 0) < API_CACHE_TTL_HORAS * 3600:
-                postos = cached.get("postos", [])
-                print(f"📦 [API ANP] cache: {len(postos)} postos em {municipio}/{uf}")
-                return postos
-        except Exception:
-            pass
-    postos = []
-    try:
-        params = {"municipio": municipio.upper().strip(), "uf": uf.upper().strip()}
-        print(f"📡 [API ANP] consultando {API_ANP_REVENDEDORES} params={params}...")
-        r = _sessao.get(API_ANP_REVENDEDORES, params=params, timeout=30)
-        print(f"📡 [API ANP] status: {r.status_code}")
-        r.raise_for_status()
-        dados = r.json()
-        itens = []
-        if isinstance(dados, dict):
-            itens = dados.get("data") or dados.get("items") or []
-            if not isinstance(itens, list):
-                itens = []
-        elif isinstance(dados, list):
-            itens = dados
-        print(f"📡 [API ANP] {len(itens)} registros brutos recebidos")
-        for item in itens:
-            posto = _extrair_posto_api(item, municipio, uf)
-            if posto:
-                postos.append(posto)
-        unicos = {}
-        for p in postos:
-            unicos[p["cnpj"]] = p
-        postos = list(unicos.values())
-        print(f"✅ [API ANP] {len(postos)} postos únicos em {municipio}/{uf}")
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump({"_ts": time.time(), "postos": postos}, f, ensure_ascii=False)
-        except Exception as e:
-            print(f"⚠️ [API ANP] erro salvando cache: {e}")
-        return postos
-    except Exception as e:
-        print(f"❌ [API ANP] erro: {e}")
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    cached = json.load(f)
-                print(f"⚠️ [API ANP] usando cache expirado ({len(cached.get('postos', []))} postos)")
-                return cached.get("postos", [])
-            except Exception:
-                pass
-        return []
-
 def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
+    """Extrai posto da API. Aceita posto SEM CNPJ (gera chave sintética)."""
     if not isinstance(item, dict):
         return None
     cnpj = normalizar_cnpj(item.get("cnpj") or item.get("CNPJ") or "")
-    if not cnpj:
-        return None
     lat_str = item.get("latitude") or item.get("Latitude")
     lon_str = item.get("longitude") or item.get("Longitude")
     lat_f = lon_f = None
@@ -338,10 +341,18 @@ def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
     endereco = re.sub(r"\s+", " ", str(endereco)).strip().strip(",")
     if not endereco:
         endereco = "Endereço não disponível na base ANP"
+    revenda = item.get("razaoSocial") or item.get("razao_social") or item.get("Razão Social") or ""
+    nome_fantasia = item.get("nomeFantasia") or item.get("nome_fantasia") or ""
+
+    if not cnpj:
+        base = f"{revenda}|{endereco}|{municipio}|{uf}".upper()
+        h = hashlib.md5(base.encode("utf-8")).hexdigest()[:14]
+        cnpj = f"SEMCNPJ_{h}"
+
     return {
         "cnpj": cnpj,
-        "revenda": item.get("razaoSocial") or item.get("razao_social") or item.get("Razão Social") or "",
-        "nome_fantasia": item.get("nomeFantasia") or item.get("nome_fantasia") or "",
+        "revenda": revenda,
+        "nome_fantasia": nome_fantasia,
         "endereco": endereco,
         "bairro": item.get("bairro") or item.get("Bairro") or "",
         "municipio": item.get("municipio") or item.get("Município") or municipio,
@@ -351,7 +362,172 @@ def _extrair_posto_api(item: dict, municipio: str, uf: str) -> dict:
         "bandeira": item.get("distribuidora") or item.get("Distribuidora") or "",
         "latitude": lat_f,
         "longitude": lon_f,
+        "cnpj_sintetico": cnpj.startswith("SEMCNPJ_"),
     }
+
+def _get_api_anp(params: dict, timeout: float = TIMEOUT_API_ANP):
+    """
+    GET direto (sem _sessao) para a API ANP — evita problemas de thread-safety
+    quando outras threads (_ensure_csv_async) usam a _sessao em paralelo.
+    """
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; CombustivelApp/1.0)",
+    }
+    return requests.get(
+        API_ANP_REVENDEDORES,
+        params=params,
+        headers=headers,
+        timeout=timeout,
+    )
+
+def _buscar_paginas_anp(municipio: str, uf: str):
+    """
+    Busca paginada com fallback de variantes.
+    Manual ANP: município SEM caracteres especiais; paginação via 'numeropagina'.
+    Usa requests.get direto (não a _sessao) para evitar conflito entre threads.
+    """
+    municipio_norm = _normalizar_municipio_api(municipio)
+    uf_norm = normalizar_texto(uf)
+
+    variantes = [
+        {"municipio": municipio_norm, "uf": uf_norm, "numeropagina": 1},
+        {"municipio": municipio_norm, "uf": uf_norm},
+        {"municipio": municipio, "uf": uf},
+    ]
+
+    itens = []
+    total_registro = None
+    params_vencedores = None
+
+    for params in variantes:
+        try:
+            r = _get_api_anp(params)
+            if r.status_code != 200:
+                print(f"⚠️ [API ANP] variante {params} → HTTP {r.status_code}: {r.text[:150]}")
+                continue
+            dados = r.json()
+            itens_parsed = []
+            if isinstance(dados, dict):
+                itens_parsed = dados.get("data") or dados.get("items") or []
+                filtro = dados.get("searchPageFilter") or {}
+                tr = filtro.get("totalRegistro")
+                if tr is not None:
+                    try:
+                        total_registro = int(tr)
+                    except (TypeError, ValueError):
+                        pass
+            elif isinstance(dados, list):
+                itens_parsed = dados
+            if itens_parsed:
+                print(f"✅ [API ANP] variante vencedora: {params} → {len(itens_parsed)} itens (total {total_registro})")
+                itens = itens_parsed
+                params_vencedores = params
+                break
+            else:
+                print(f"ℹ️ [API ANP] variante {params} respondeu vazio")
+        except Exception as e:
+            print(f"⚠️ [API ANP] variante {params} erro: {e}")
+
+    if not itens:
+        return [], None, "Nenhuma variante retornou dados"
+
+    if "numeropagina" in params_vencedores and total_registro and len(itens) < total_registro:
+        pagina = 2
+        while pagina <= API_ANP_MAX_PAGINAS:
+            try:
+                p = dict(params_vencedores)
+                p["numeropagina"] = pagina
+                r = _get_api_anp(p)
+                if r.status_code != 200:
+                    break
+                dados = r.json()
+                if isinstance(dados, dict):
+                    novos = dados.get("data") or dados.get("items") or []
+                elif isinstance(dados, list):
+                    novos = dados
+                else:
+                    novos = []
+                if not novos:
+                    break
+                print(f"📡 [API ANP] página {pagina}: {len(novos)} itens")
+                itens.extend(novos)
+                if len(itens) >= total_registro:
+                    break
+                pagina += 1
+            except Exception as e:
+                print(f"⚠️ [API ANP] página {pagina} erro: {e}")
+                break
+
+    return itens, total_registro, None
+
+def buscar_postos_anp_api(municipio: str, uf: str) -> list:
+    """
+    Fonte cadastral ANP com paginação.
+
+    Regras:
+      1. Sempre tenta a API (SEM gate de esta_online — falso negativo não bloqueia).
+      2. Se a API retornar itens => salva no cache e usa.
+      3. Se a API falhar ou retornar vazio => usa cache existente (mesmo expirado).
+      4. Só retorna [] se não houver nada mesmo.
+    """
+    cache_file = _api_cache_path(municipio, uf)
+    cached_postos = None
+    cached_ts = 0
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cached_postos = cached.get("postos") or []
+            cached_ts = cached.get("_ts", 0)
+            # Cache fresco + sem internet => retorna logo para poupar tempo
+            if time.time() - cached_ts < API_CACHE_TTL_HORAS * 3600 and not esta_online():
+                print(f"📦 [API ANP] cache fresco + offline: {len(cached_postos)} postos")
+                return cached_postos
+        except Exception as e:
+            print(f"⚠️ [API ANP] erro lendo cache: {e}")
+
+    # ✅ SEM gate de online: tenta a API sempre. Se der timeout, o requests levanta exceção
+    #    e cai no except, onde usamos o cache.
+    print(f"📡 [API ANP] consultando {municipio}/{uf} (normalizado: {_normalizar_municipio_api(municipio)})...")
+    try:
+        itens, total_registro, _ = _buscar_paginas_anp(municipio, uf)
+    except Exception as e:
+        print(f"❌ [API ANP] erro de rede: {e}")
+        if cached_postos:
+            print(f"📴 [API ANP] usando cache ({len(cached_postos)} postos)")
+            return cached_postos
+        return []
+
+    print(f"📡 [API ANP] {len(itens)} registros brutos (totalRegistro={total_registro})")
+
+    if not itens:
+        if cached_postos:
+            print(f"⚠️ [API ANP] API retornou 0 — mantendo cache de {len(cached_postos)} postos")
+            return cached_postos
+        print("❌ [API ANP] API retornou 0 e não há cache — retornando vazio")
+        return []
+
+    postos = []
+    for item in itens:
+        posto = _extrair_posto_api(item, municipio, uf)
+        if posto:
+            postos.append(posto)
+
+    unicos = {}
+    for p in postos:
+        unicos[p["cnpj"]] = p
+    postos = list(unicos.values())
+    print(f"✅ [API ANP] {len(postos)} postos únicos em {municipio}/{uf}")
+
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump({"_ts": time.time(), "postos": postos,
+                       "total_registro_anp": total_registro}, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ [API ANP] erro salvando cache: {e}")
+
+    return postos
 
 # ======================== CSV DE PREÇOS ========================
 def gerar_nome_csv(produto="gasolina"):
@@ -359,14 +535,28 @@ def gerar_nome_csv(produto="gasolina"):
     data_str = agora.strftime("%d%m%Y_%H%M")
     return os.path.join(CSV_DATA_DIR, f"precos_anp_{produto.lower()}_{data_str}.csv")
 
+def _timestamp_do_nome(caminho: str) -> float:
+    m = re.search(r"(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})", os.path.basename(caminho))
+    if not m:
+        try:
+            return os.path.getmtime(caminho)
+        except Exception:
+            return 0
+    d, mo, y, h, mi = map(int, m.groups())
+    try:
+        return datetime(y, mo, d, h, mi).timestamp()
+    except ValueError:
+        return 0
+
 def obter_csv_mais_recente(produto=None):
     if not os.path.exists(CSV_DATA_DIR):
         return None
-    padrao = os.path.join(CSV_DATA_DIR, f"precos_anp_{produto.lower()}_*.csv") if produto else os.path.join(CSV_DATA_DIR, "precos_anp_*.csv")
+    padrao = (os.path.join(CSV_DATA_DIR, f"precos_anp_{produto.lower()}_*.csv")
+              if produto else os.path.join(CSV_DATA_DIR, "precos_anp_*.csv"))
     arquivos = glob.glob(padrao)
     if not arquivos:
         return None
-    arquivos.sort(key=os.path.getmtime, reverse=True)
+    arquivos.sort(key=_timestamp_do_nome, reverse=True)
     return arquivos[0]
 
 def idade_csv_dias(caminho):
@@ -387,7 +577,7 @@ def listar_csvs_antigos(dias=DIAS_PARA_CONSIDERAR_ANTIGO):
         produto = partes[0] if partes else "desconhecido"
         por_produto.setdefault(produto, []).append(caminho)
     for produto, lista in por_produto.items():
-        lista.sort(key=os.path.getmtime, reverse=True)
+        lista.sort(key=_timestamp_do_nome, reverse=True)
         for caminho in lista[1:]:
             idade_dias = (agora - os.path.getmtime(caminho)) / 86400
             if idade_dias >= dias:
@@ -412,9 +602,12 @@ def apagar_csv(caminho):
 # ======================== DESCOBERTA DINÂMICA DE URLs DA ANP ========================
 def descobrir_urls_csv_anp():
     urls_encontradas = {}
+    if not esta_online():
+        print("📴 [ANP] offline — pulando raspagem de página")
+        return {}
     try:
         print(f"🌐 [ANP] raspando página para descobrir URLs dos CSVs...")
-        r = _sessao.get(PAGINA_ANP, headers=HEADERS_NAVEGADOR, timeout=30)
+        r = requests.get(PAGINA_ANP, headers=HEADERS_NAVEGADOR, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, "html.parser")
         for a in soup.find_all("a", href=True):
@@ -486,12 +679,15 @@ def obter_url_csv(produto: str) -> str:
     return None
 
 def encontrar_link_csv_anp(produto="gasolina"):
+    if not esta_online():
+        return None
     url = obter_url_csv(produto)
     if not url:
         return None
     try:
         print(f"🔗 [CSV] testando URL: {url}")
-        r = _sessao.get(url, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
+        r = requests.get(url, headers=HEADERS_CSV, timeout=TIMEOUT_DOWNLOAD_CSV,
+                         allow_redirects=True, stream=True)
         ct = (r.headers.get("content-type") or "").lower()
         status = r.status_code
         if status == 200 and ("csv" in ct or "octet-stream" in ct or "text/plain" in ct or "text/html" not in ct):
@@ -508,7 +704,8 @@ def encontrar_link_csv_anp(produto="gasolina"):
         if url_alt == url:
             continue
         try:
-            r = _sessao.get(url_alt, headers=HEADERS_CSV, timeout=20, allow_redirects=True, stream=True)
+            r = requests.get(url_alt, headers=HEADERS_CSV, timeout=TIMEOUT_DOWNLOAD_CSV,
+                             allow_redirects=True, stream=True)
             ct = (r.headers.get("content-type") or "").lower()
             if r.status_code == 200 and "text/html" not in ct:
                 chunk = next(r.iter_content(chunk_size=1), b"")
@@ -522,43 +719,114 @@ def encontrar_link_csv_anp(produto="gasolina"):
 # ======================== HEALTH E TESTES ========================
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "combustivel"}
+    return {"status": "ok", "service": "combustivel", "online": esta_online()}
+
+@app.get("/api/offline-status")
+def offline_status():
+    online = esta_online()
+    csvs = {}
+    for p in PRODUTOS:
+        c = obter_csv_mais_recente(p)
+        idade = idade_csv_dias(c)
+        csvs[p] = {
+            "arquivo": c,
+            "existe": c is not None,
+            "idade_dias": round(idade, 2) if idade is not None else None,
+        }
+    return {"online": online, "csvs": csvs}
 
 @app.get("/api/testar-api-anp")
 def testar_api_anp(municipio: str = "VITORIA", uf: str = "ES"):
-    params = {"municipio": municipio.upper(), "uf": uf.upper()}
-    url = API_ANP_REVENDEDORES
     resultado = {
         "municipio": municipio, "uf": uf,
-        "url_testada": f"{url}?municipio={params['municipio']}&uf={params['uf']}",
-        "status_code": None, "content_type": None, "tipo_resposta": None,
-        "chaves": None, "total_items": 0, "total_registro_anp": None,
-        "primeiro_item": None, "primeiro_item_extraido": None, "erro": None,
+        "municipio_normalizado": _normalizar_municipio_api(municipio),
+        "variantes_testadas": [], "erro_geral": None,
+        "total_registro_anp": None, "total_items": 0,
+        "primeiro_item_extraido": None,
     }
-    try:
-        r = _sessao.get(url, params=params, timeout=30)
-        resultado["status_code"] = r.status_code
-        resultado["content_type"] = r.headers.get("content-type")
-        dados = r.json()
-        if isinstance(dados, dict):
-            resultado["tipo_resposta"] = "dict"
-            resultado["chaves"] = list(dados.keys())
-            itens = dados.get("data") or dados.get("items") or []
-            resultado["total_items"] = len(itens)
-            filtro = dados.get("searchPageFilter") or {}
-            resultado["total_registro_anp"] = filtro.get("totalRegistro")
-            if itens:
-                resultado["primeiro_item"] = itens[0]
-                resultado["primeiro_item_extraido"] = _extrair_posto_api(itens[0], municipio, uf)
-        elif isinstance(dados, list):
-            resultado["tipo_resposta"] = "list"
-            resultado["total_items"] = len(dados)
-            if dados:
-                resultado["primeiro_item"] = dados[0]
-                resultado["primeiro_item_extraido"] = _extrair_posto_api(dados[0], municipio, uf)
-    except Exception as e:
-        resultado["erro"] = str(e)
+
+    municipio_norm = _normalizar_municipio_api(municipio)
+    uf_norm = normalizar_texto(uf)
+    variantes = [
+        {"municipio": municipio_norm, "uf": uf_norm, "numeropagina": 1},
+        {"municipio": municipio_norm, "uf": uf_norm},
+        {"municipio": municipio, "uf": uf},
+    ]
+
+    for params in variantes:
+        info = {"params": params, "status": None, "content_type": None, "raw_preview": None, "itens": 0}
+        try:
+            r = _get_api_anp(params)
+            info["status"] = r.status_code
+            info["content_type"] = r.headers.get("content-type")
+            info["raw_preview"] = r.text[:200]
+            if r.status_code == 200:
+                dados = r.json()
+                itens = dados.get("data") if isinstance(dados, dict) else dados
+                itens = itens or []
+                info["itens"] = len(itens)
+                if isinstance(dados, dict):
+                    filtro = dados.get("searchPageFilter") or {}
+                    info["total_registro_anp"] = filtro.get("totalRegistro")
+                if itens:
+                    info["primeiro_item_extraido"] = _extrair_posto_api(itens[0], municipio, uf)
+                    resultado["total_registro_anp"] = info.get("total_registro_anp")
+                    resultado["total_items"] = len(itens)
+                    resultado["primeiro_item_extraido"] = info["primeiro_item_extraido"]
+        except Exception as e:
+            info["erro"] = str(e)
+        resultado["variantes_testadas"].append(info)
+
     return resultado
+
+@app.get("/api/debug-precos-api")
+def debug_precos_api(municipio: str, uf: str):
+    """Diagnóstico: mostra passo a passo o que buscar_postos_anp_api faz."""
+    online = esta_online()
+    postos = buscar_postos_anp_api(municipio, uf)
+    cache_file = _api_cache_path(municipio, uf)
+    cache_existe = os.path.exists(cache_file)
+    cache_total = 0
+    total_registro = None
+    if cache_existe:
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            cache_total = len(cached.get("postos") or [])
+            total_registro = cached.get("total_registro_anp")
+        except Exception:
+            pass
+    return {
+        "municipio": municipio,
+        "uf": uf,
+        "municipio_normalizado": _normalizar_municipio_api(municipio),
+        "online": online,
+        "total_postos_retornados": len(postos),
+        "cache_existe": cache_existe,
+        "cache_total_postos": cache_total,
+        "cache_total_registro_anp": total_registro,
+    }
+
+@app.get("/api/postos-anp")
+def postos_anp(municipio: str, uf: str):
+    """Lista TODOS os postos autorizados da ANP (sem depender de CSV)."""
+    postos = buscar_postos_anp_api(municipio, uf)
+    cache_file = _api_cache_path(municipio, uf)
+    total_registro = None
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            total_registro = cached.get("total_registro_anp")
+        except Exception:
+            pass
+    return {
+        "municipio": municipio, "uf": uf,
+        "total_postos": len(postos),
+        "total_registro_anp": total_registro,
+        "online": esta_online(),
+        "postos": postos,
+    }
 
 @app.get("/api/descobrir-links-anp")
 def descobrir_links_anp():
@@ -571,6 +839,18 @@ def baixar_csv(tipo: str = "gasolina"):
         if tipo.lower() not in CSV_URLS_ANP:
             raise Exception(f"Produto desconhecido: {tipo}")
         os.makedirs(CSV_DATA_DIR, exist_ok=True)
+
+        if not esta_online():
+            csv_local = obter_csv_mais_recente(tipo)
+            if csv_local:
+                idade = idade_csv_dias(csv_local)
+                return {
+                    "status": "ok_offline", "arquivo": csv_local, "url_usada": None,
+                    "tamanho_bytes": os.path.getsize(csv_local),
+                    "aviso": f"Sem internet. Usando CSV local com {idade:.1f} dias.",
+                }
+            return {"erro": "Sem internet e sem CSV local"}
+
         csv_url = encontrar_link_csv_anp(tipo)
         if not csv_url:
             csv_local = obter_csv_mais_recente(tipo)
@@ -579,14 +859,16 @@ def baixar_csv(tipo: str = "gasolina"):
                 return {
                     "status": "ok_offline", "arquivo": csv_local, "url_usada": None,
                     "tamanho_bytes": os.path.getsize(csv_local),
-                    "aviso": f"Não foi possível baixar CSV novo. Usando arquivo local com {idade:.1f} dias.",
+                    "aviso": f"Não foi possível descobrir link. Usando local com {idade:.1f} dias.",
                 }
-            raise Exception(f"CSV não encontrado para {tipo} e não há arquivo local.")
-        r = _sessao.get(csv_url, headers=HEADERS_CSV, timeout=180, stream=True, allow_redirects=True)
+            raise Exception(f"CSV não encontrado para {tipo}.")
+
+        r = requests.get(csv_url, headers=HEADERS_CSV, timeout=TIMEOUT_DOWNLOAD_CSV,
+                         stream=True, allow_redirects=True)
         r.raise_for_status()
         ct = (r.headers.get("content-type") or "").lower()
         if "text/html" in ct and "csv" not in ct:
-            raise Exception(f"Servidor retornou HTML em vez de CSV")
+            raise Exception("Servidor retornou HTML em vez de CSV")
         caminho_destino = gerar_nome_csv(tipo)
         with open(caminho_destino, "wb") as f:
             for chunk in r.iter_content(chunk_size=8192):
@@ -600,10 +882,10 @@ def baixar_csv(tipo: str = "gasolina"):
                 return {
                     "status": "ok_offline", "arquivo": csv_local, "url_usada": csv_url,
                     "tamanho_bytes": os.path.getsize(csv_local),
-                    "aviso": "Download falhou (arquivo muito pequeno). Usando CSV local.",
+                    "aviso": "Download falhou. Usando CSV local.",
                 }
             raise Exception(f"Arquivo muito pequeno ({tamanho} bytes)")
-        print(f"✅ [baixar-csv] {tipo}: {tamanho} bytes salvos em {caminho_destino}")
+        print(f"✅ [baixar-csv] {tipo}: {tamanho} bytes em {caminho_destino}")
         return {"status": "ok", "arquivo": caminho_destino, "url_usada": csv_url, "tamanho_bytes": tamanho}
     except Exception as e:
         print(f"❌ [baixar-csv] {tipo}: {e}")
@@ -616,15 +898,30 @@ def baixar_csv(tipo: str = "gasolina"):
             }
         return {"erro": str(e)}
 
-# ======================== GARANTIR CSVs ========================
+# ======================== GARANTIR CSVs (offline-safe) ========================
+_download_locks = {p: threading.Lock() for p in PRODUTOS}
+
 def garantir_todos_csvs(force_rebaixar_antigos=True):
     status_por_produto = {}
+    online = esta_online()
+
     for produto in PRODUTOS:
         caminho = obter_csv_mais_recente(produto)
         idade = idade_csv_dias(caminho)
+
+        if not online:
+            status_por_produto[produto] = {
+                "acao": "offline_usando_cache",
+                "ok": caminho is not None,
+                "arquivo": caminho,
+                "idade_dias": round(idade, 2) if idade is not None else None,
+            }
+            continue
+
         if caminho is None:
             print(f"📥 [garantir] {produto}: sem CSV local, baixando...")
-            resultado = baixar_csv(tipo=produto)
+            with _download_locks[produto]:
+                resultado = baixar_csv(tipo=produto)
             status_por_produto[produto] = {
                 "acao": "baixado",
                 "ok": resultado.get("status") in ("ok", "ok_offline"),
@@ -632,13 +929,15 @@ def garantir_todos_csvs(force_rebaixar_antigos=True):
                 "erro": resultado.get("erro"),
             }
             continue
+
         if force_rebaixar_antigos and idade is not None and idade > IDADE_MAXIMA_CSV_DIAS:
             print(f"📥 [garantir] {produto}: CSV com {idade:.1f} dias, rebaixando...")
-            resultado = baixar_csv(tipo=produto)
+            with _download_locks[produto]:
+                resultado = baixar_csv(tipo=produto)
             novo_caminho = obter_csv_mais_recente(produto)
             status_por_produto[produto] = {
                 "acao": "rebaixado",
-                "ok": resultado.get("status") == "ok",
+                "ok": resultado.get("status") in ("ok", "ok_offline") and novo_caminho is not None,
                 "arquivo_anterior": caminho,
                 "arquivo_novo": novo_caminho,
                 "erro": resultado.get("erro"),
@@ -649,6 +948,20 @@ def garantir_todos_csvs(force_rebaixar_antigos=True):
                 "idade_dias": round(idade, 2) if idade is not None else None,
             }
     return status_por_produto
+
+def _ensure_csv_async(produto: str):
+    def _work():
+        try:
+            if not esta_online():
+                return
+            caminho = obter_csv_mais_recente(produto)
+            idade = idade_csv_dias(caminho) if caminho else None
+            if caminho is None or (idade is not None and idade > IDADE_MAXIMA_CSV_DIAS):
+                with _download_locks[produto]:
+                    baixar_csv(tipo=produto)
+        except Exception as e:
+            print(f"⚠️ [_ensure_csv_async] {produto}: {e}")
+    threading.Thread(target=_work, daemon=True).start()
 
 # ======================== PARSING CSV ========================
 def _extrair_data_referencia(df: pd.DataFrame):
@@ -709,181 +1022,207 @@ def _detectar_colunas(df: pd.DataFrame):
         "bairro": col_bairro, "cnpj": col_cnpj, "bandeira": col_bandeira,
     }
 
+# ======================== MERGE / MAPEAMENTO DE PRODUTOS ========================
+MAPEAMENTO_PRODUTOS = [
+    ("GASOLINA ADITIVADA", "gasolina_aditivada"),
+    ("GASOLINA", "gasolina"),
+    ("ETANOL HIDRATADO", "etanol"),
+    ("ETANOL", "etanol"),
+    ("DIESEL S10", "diesel_s10"),
+    ("DIESEL S-10", "diesel_s10"),
+    ("DIESEL S500", "diesel_s500"),
+    ("DIESEL S-500", "diesel_s500"),
+    ("DIESEL", "diesel"),
+    ("GNV", "gnv"),
+    ("GLP", "glp"),
+]
+
+def _filtrar_df_por_produto(df_filtrado, prod_chave, col_produto_norm="_produto_norm"):
+    if prod_chave == "GASOLINA":
+        return df_filtrado[df_filtrado[col_produto_norm] == "GASOLINA"]
+    if prod_chave == "GASOLINA ADITIVADA":
+        return df_filtrado[df_filtrado[col_produto_norm] == "GASOLINA ADITIVADA"]
+    if prod_chave == "ETANOL":
+        return df_filtrado[df_filtrado[col_produto_norm] == "ETANOL"]
+    if prod_chave == "ETANOL HIDRATADO":
+        return df_filtrado[df_filtrado[col_produto_norm].str.contains("ETANOL HIDRATADO", na=False)]
+    if prod_chave == "DIESEL":
+        return df_filtrado[df_filtrado[col_produto_norm] == "DIESEL"]
+    return df_filtrado[df_filtrado[col_produto_norm].str.contains(prod_chave, na=False)]
+
+def _extrair_mapa_precos(df_prod, cols, prod_label):
+    mapa = {}
+    if df_prod.empty:
+        return mapa
+    for _, row in df_prod.iterrows():
+        try:
+            preco = float(str(row[cols["valor"]]).replace(",", "."))
+        except (ValueError, TypeError):
+            continue
+        if not validar_preco(prod_label, preco):
+            continue
+        cnpj_limpo = normalizar_cnpj(row[cols["cnpj"]]) if cols["cnpj"] else ""
+        if not cnpj_limpo:
+            continue
+        revenda_csv = str(row[cols["revenda"]]).strip() if cols["revenda"] else ""
+        endereco_csv = str(row[cols["endereco"]]).strip() if cols["endereco"] else ""
+        bairro_csv = str(row[cols["bairro"]]).strip() if cols["bairro"] else ""
+        bandeira_csv = str(row[cols["bandeira"]]).strip() if cols["bandeira"] else ""
+        mapa[cnpj_limpo] = {
+            "preco": round(preco, 2),
+            "bandeira": bandeira_csv,
+            "revenda": revenda_csv,
+            "endereco": endereco_csv,
+            "bairro": bairro_csv,
+        }
+    return mapa
+
+def _montar_postos_para_produto(postos_api, mapa_precos, prod_label, fonte_dado,
+                                municipio, uf, incluir_sem_preco):
+    postos_merge = {}
+
+    for p in postos_api:
+        cnpj_key = normalizar_cnpj(p["cnpj"]) if not p.get("cnpj_sintetico") else p["cnpj"]
+        postos_merge[cnpj_key] = {
+            **p,
+            "cnpj": cnpj_key,
+            "preco": 0.0,
+            "tem_preco": False,
+            "produto": prod_label.upper(),
+            "cnpj_orfao": False,
+            "fonte_dado": "sem_preco_anp",
+            "autorizado_anp": True,
+        }
+
+    for cnpj_limpo, dados_preco in mapa_precos.items():
+        if cnpj_limpo in postos_merge:
+            postos_merge[cnpj_limpo]["preco"] = dados_preco["preco"]
+            postos_merge[cnpj_limpo]["tem_preco"] = True
+            postos_merge[cnpj_limpo]["fonte_dado"] = fonte_dado
+            if dados_preco["bandeira"]:
+                postos_merge[cnpj_limpo]["bandeira"] = dados_preco["bandeira"]
+        else:
+            postos_merge[cnpj_limpo] = {
+                "cnpj": cnpj_limpo,
+                "revenda": dados_preco.get("revenda") or f"Posto {cnpj_limpo}",
+                "nome_fantasia": dados_preco.get("revenda") or "",
+                "endereco": dados_preco.get("endereco") or "Endereço não disponível",
+                "bairro": dados_preco.get("bairro") or "",
+                "municipio": municipio,
+                "uf": uf,
+                "cep": "",
+                "bandeira": dados_preco.get("bandeira") or "",
+                "preco": dados_preco["preco"],
+                "tem_preco": True,
+                "produto": prod_label.upper(),
+                "latitude": None,
+                "longitude": None,
+                "cnpj_orfao": True,
+                "fonte_dado": fonte_dado,
+                "autorizado_anp": True,
+                "cnpj_sintetico": False,
+            }
+
+    postos_lista = list(postos_merge.values())
+
+    if not incluir_sem_preco:
+        postos_lista = [p for p in postos_lista if p["preco"] > 0]
+
+    return postos_lista
+
 # ======================== ENDPOINT PRINCIPAL ========================
 @app.get("/api/precos")
 def get_precos(
     municipio: str, uf: str, produto: str = None,
     incluir_sem_preco: bool = Query(True),
     geocodificar_cep: bool = Query(True),
+    apenas_cadastro: bool = Query(False, description="Se true, retorna todos os postos da API ANP mesmo sem CSV/preço."),
 ):
-    """
-    Retorna TODOS os postos autorizados pela ANP no município.
-    A fonte primária é o CSV de preços (que contém todos os CNPJs pesquisados).
-    A API de revendedores é usada para enriquecer com dados cadastrais.
-    Postos sem preço também são retornados.
-    """
     municipio_norm = normalizar_texto(municipio)
     uf_norm = normalizar_texto(uf)
-    print(f"\n{'='*60}\n🔍 {municipio}/{uf} - produto: {produto or 'todos'}\n{'='*60}")
+    online = esta_online()
+    print(f"\n{'='*60}\n🔍 {municipio}/{uf} - produto: {produto or 'todos'} | online={online} | apenas_cadastro={apenas_cadastro}\n{'='*60}")
 
-    # 1. Busca postos da API (enriquecimento cadastral)
     postos_api = buscar_postos_anp_api(municipio, uf)
     total_autorizados_api = len(postos_api)
     print(f"📋 Base ANP (API): {total_autorizados_api} postos")
 
-    # 2. Garante CSVs atualizados
-    garantir_todos_csvs(force_rebaixar_antigos=True)
-    csvs_disponiveis = {p: obter_csv_mais_recente(p) for p in PRODUTOS}
+    csvs_disponiveis = {}
+    for p in PRODUTOS:
+        c = obter_csv_mais_recente(p)
+        csvs_disponiveis[p] = c
+        if online and (c is None or (idade_csv_dias(c) or 999) > IDADE_MAXIMA_CSV_DIAS):
+            _ensure_csv_async(p)
 
-    # 3. Processa cada CSV
     try:
         resultados = {}
-        # Mapa global de CNPJs encontrados no CSV (para contar total de autorizados)
         cnpjs_csv_global = set()
 
         for tipo_csv, caminho in csvs_disponiveis.items():
-            if not caminho:
-                continue
-            idade = idade_csv_dias(caminho)
-            fonte_dado = "csv_anp_atual" if (idade is not None and idade <= IDADE_MAXIMA_CSV_DIAS) else "csv_anp_antigo"
-            try:
-                df = pd.read_csv(caminho, sep=";", encoding="latin1", decimal=",")
-            except Exception as e:
-                print(f"⚠️ Erro lendo {caminho}: {e}")
-                continue
-            df.columns = [c.replace("ï»¿", "").strip() for c in df.columns]
-            data_ref = _extrair_data_referencia(df)
-            cols = _detectar_colunas(df)
-            if not all([cols["municipio"], cols["uf"], cols["produto"], cols["valor"]]):
-                continue
+            df = None
+            cols = None
+            data_ref = None
+            idade = None
+            fonte_dado = "sem_csv"
+            if caminho:
+                idade = idade_csv_dias(caminho)
+                fonte_dado = "csv_anp_atual" if (idade is not None and idade <= IDADE_MAXIMA_CSV_DIAS) else "csv_anp_antigo"
+                try:
+                    df = pd.read_csv(caminho, sep=";", encoding="latin1", decimal=",")
+                    df.columns = [c.replace("ï»¿", "").strip() for c in df.columns]
+                    data_ref = _extrair_data_referencia(df)
+                    cols = _detectar_colunas(df)
+                    if not all([cols["municipio"], cols["uf"], cols["produto"], cols["valor"]]):
+                        df = None
+                        cols = None
+                except Exception as e:
+                    print(f"⚠️ Erro lendo {caminho}: {e}")
+                    df = None
 
-            df["_municipio_norm"] = df[cols["municipio"]].astype(str).apply(normalizar_texto)
-            df["_uf_norm"] = df[cols["uf"]].astype(str).apply(normalizar_texto)
-            df["_produto_norm"] = df[cols["produto"]].astype(str).apply(normalizar_texto)
+            df_filtrado = None
+            if df is not None:
+                df["_municipio_norm"] = df[cols["municipio"]].astype(str).apply(normalizar_texto)
+                df["_uf_norm"] = df[cols["uf"]].astype(str).apply(normalizar_texto)
+                df["_produto_norm"] = df[cols["produto"]].astype(str).apply(normalizar_texto)
+                df_filtrado = df[(df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)]
+                if df_filtrado.empty:
+                    df_filtrado = df[(df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)]
+                if df_filtrado.empty:
+                    df_filtrado = None
 
-            df_filtrado = df[(df["_municipio_norm"] == municipio_norm) & (df["_uf_norm"] == uf_norm)]
-            if df_filtrado.empty:
-                df_filtrado = df[(df["_municipio_norm"].str.contains(municipio_norm, na=False)) & (df["_uf_norm"] == uf_norm)]
-            if df_filtrado.empty:
-                continue
-
-            # Registra CNPJs do CSV para contagem global
-            if cols["cnpj"]:
+            if df_filtrado is not None and cols and cols["cnpj"]:
                 for c in df_filtrado[cols["cnpj"]].dropna().tolist():
                     cnpj_limpo = normalizar_cnpj(c)
                     if len(cnpj_limpo) == 14:
                         cnpjs_csv_global.add(cnpj_limpo)
 
-            mapeamento_produtos = [
-                ("GASOLINA ADITIVADA", "gasolina_aditivada"), ("GASOLINA", "gasolina"),
-                ("ETANOL HIDRATADO", "etanol"), ("ETANOL", "etanol"),
-                ("DIESEL S10", "diesel_s10"), ("DIESEL S-10", "diesel_s10"),
-                ("DIESEL S500", "diesel_s500"), ("DIESEL S-500", "diesel_s500"),
-                ("DIESEL", "diesel"), ("GNV", "gnv"), ("GLP", "glp"),
-            ]
-            for prod_chave, prod_label in mapeamento_produtos:
+            for prod_chave, prod_label in MAPEAMENTO_PRODUTOS:
                 if produto and prod_label != produto.lower():
                     continue
 
-                if prod_chave == "GASOLINA":
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA"]
-                elif prod_chave == "GASOLINA ADITIVADA":
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "GASOLINA ADITIVADA"]
-                elif prod_chave == "ETANOL":
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "ETANOL"]
-                elif prod_chave == "ETANOL HIDRATADO":
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains("ETANOL HIDRATADO", na=False)]
-                elif prod_chave == "DIESEL":
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"] == "DIESEL"]
-                else:
-                    df_prod = df_filtrado[df_filtrado["_produto_norm"].str.contains(prod_chave, na=False)]
-
-                # Mapa de preços por CNPJ (do CSV)
                 mapa_precos = {}
-                if not df_prod.empty:
-                    for _, row in df_prod.iterrows():
-                        try:
-                            preco = float(str(row[cols["valor"]]).replace(",", "."))
-                        except (ValueError, TypeError):
-                            continue
-                        if not validar_preco(prod_label, preco):
-                            continue
-                        cnpj_limpo = normalizar_cnpj(row[cols["cnpj"]]) if cols["cnpj"] else ""
-                        if not cnpj_limpo:
-                            continue
-                        # Extrai dados cadastrais do CSV como fallback
-                        revenda_csv = str(row[cols["revenda"]]).strip() if cols["revenda"] else ""
-                        endereco_csv = str(row[cols["endereco"]]).strip() if cols["endereco"] else ""
-                        bairro_csv = str(row[cols["bairro"]]).strip() if cols["bairro"] else ""
-                        bandeira_csv = str(row[cols["bandeira"]]).strip() if cols["bandeira"] else ""
-                        mapa_precos[cnpj_limpo] = {
-                            "preco": round(preco, 2),
-                            "bandeira": bandeira_csv,
-                            "revenda": revenda_csv,
-                            "endereco": endereco_csv,
-                            "bairro": bairro_csv,
-                        }
+                if df_filtrado is not None:
+                    df_prod = _filtrar_df_por_produto(df_filtrado, prod_chave)
+                    mapa_precos = _extrair_mapa_precos(df_prod, cols, prod_label)
 
-                # Monta a lista COM TODOS os autorizados (API + CSV)
-                postos_merge = {}
-
-                # 3.1 Insere todos os postos da API
-                for p in postos_api:
-                    cnpj_key = normalizar_cnpj(p["cnpj"])
-                    postos_merge[cnpj_key] = {
-                        **p,
-                        "cnpj": cnpj_key,
-                        "preco": 0.0,
-                        "tem_preco": False,
-                        "produto": prod_label.upper(),
-                        "cnpj_orfao": False,
-                        "fonte_dado": "sem_preco_anp",
-                        "autorizado_anp": True,
-                    }
-
-                # 3.2 Aplica preços do CSV nos autorizados; insere os que faltam
-                for cnpj_limpo, dados_preco in mapa_precos.items():
-                    if cnpj_limpo in postos_merge:
-                        postos_merge[cnpj_limpo]["preco"] = dados_preco["preco"]
-                        postos_merge[cnpj_limpo]["tem_preco"] = True
-                        postos_merge[cnpj_limpo]["fonte_dado"] = fonte_dado
-                        if dados_preco["bandeira"]:
-                            postos_merge[cnpj_limpo]["bandeira"] = dados_preco["bandeira"]
-                    else:
-                        # Posto do CSV que não está na API → insere com dados do CSV
-                        postos_merge[cnpj_limpo] = {
-                            "cnpj": cnpj_limpo,
-                            "revenda": dados_preco.get("revenda") or f"Posto {cnpj_limpo}",
-                            "nome_fantasia": dados_preco.get("revenda") or "",
-                            "endereco": dados_preco.get("endereco") or "Endereço não disponível",
-                            "bairro": dados_preco.get("bairro") or "",
-                            "municipio": municipio,
-                            "uf": uf,
-                            "cep": "",
-                            "bandeira": dados_preco.get("bandeira") or "",
-                            "preco": dados_preco["preco"],
-                            "tem_preco": True,
-                            "produto": prod_label.upper(),
-                            "latitude": None,
-                            "longitude": None,
-                            "cnpj_orfao": True,
-                            "fonte_dado": fonte_dado,
-                            "autorizado_anp": True,  # Consideramos autorizado (está no CSV)
-                        }
-
-                postos_lista = list(postos_merge.values())
-
-                if not incluir_sem_preco:
-                    postos_lista = [p for p in postos_lista if p["preco"] > 0]
+                postos_lista = _montar_postos_para_produto(
+                    postos_api=postos_api,
+                    mapa_precos=mapa_precos,
+                    prod_label=prod_label,
+                    fonte_dado=fonte_dado,
+                    municipio=municipio,
+                    uf=uf,
+                    incluir_sem_preco=incluir_sem_preco,
+                )
 
                 if not postos_lista:
                     continue
+                if not apenas_cadastro and not mapa_precos and not postos_api:
+                    continue
 
-                # Geocodifica postos sem coordenada
-                if geocodificar_cep:
+                if geocodificar_cep and online:
                     postos_lista = enriquecer_postos_sem_coordenada(postos_lista, limite=60)
 
-                # Estatísticas
                 precos_validos = [p["preco"] for p in postos_lista if p["preco"] > 0]
                 if precos_validos:
                     media = round(sum(precos_validos) / len(precos_validos), 2)
@@ -892,7 +1231,6 @@ def get_precos(
                 else:
                     media = minimo = maximo = None
 
-                # Ordena: com preço primeiro (menor para maior), depois sem preço
                 postos_lista.sort(key=lambda p: (
                     0 if p["preco"] > 0 else 1,
                     p["preco"] if p["preco"] > 0 else 9999,
@@ -903,7 +1241,8 @@ def get_precos(
                 sem_preco = len(postos_lista) - com_preco
                 autorizados = sum(1 for p in postos_lista if p.get("autorizado_anp"))
 
-                if prod_label not in resultados or len(postos_lista) > resultados[prod_label]["total_postos"]:
+                if (prod_label not in resultados
+                        or len(postos_lista) > resultados[prod_label]["total_postos"]):
                     resultados[prod_label] = {
                         "media": media, "minimo": minimo, "maximo": maximo,
                         "total_postos": len(postos_lista),
@@ -923,18 +1262,26 @@ def get_precos(
                 "produtos": {},
                 "fonte_api_anp": total_autorizados_api,
                 "total_autorizados_anp": 0,
+                "online": online,
             }
 
-        # Total de autorizados = união dos CNPJs da API + CSV
-        cnpjs_api = set(normalizar_cnpj(p["cnpj"]) for p in postos_api if normalizar_cnpj(p["cnpj"]))
+        cnpjs_api = set()
+        for p in postos_api:
+            if p.get("cnpj_sintetico"):
+                cnpjs_api.add(p["cnpj"])
+            else:
+                c = normalizar_cnpj(p["cnpj"])
+                if c:
+                    cnpjs_api.add(c)
         cnpjs_todos = cnpjs_api | cnpjs_csv_global
-        total_autorizados_final = len(cnpjs_todos)
 
         return {
             "municipio": municipio,
             "uf": uf,
+            "online": online,
+            "apenas_cadastro": apenas_cadastro,
             "fonte_api_anp": total_autorizados_api,
-            "total_autorizados_anp": total_autorizados_final,
+            "total_autorizados_anp": len(cnpjs_todos),
             "produtos": resultados,
         }
     except HTTPException:
@@ -951,7 +1298,7 @@ def listar_csvs_baixados():
     if not os.path.exists(CSV_DATA_DIR):
         return {"total": 0, "arquivos": []}
     arquivos = glob.glob(os.path.join(CSV_DATA_DIR, "precos_anp_*.csv"))
-    arquivos.sort(key=os.path.getmtime, reverse=True)
+    arquivos.sort(key=_timestamp_do_nome, reverse=True)
     return {"total": len(arquivos), "arquivos": [
         {"arquivo": c, "nome": os.path.basename(c), "tamanho_bytes": os.path.getsize(c),
          "idade_dias": round(idade_csv_dias(c), 2) if idade_csv_dias(c) is not None else None,
@@ -979,6 +1326,7 @@ def status_atualizacao():
         status["mensagem"] = f"{len(status['csvs_antigos'])} arquivo(s) antigo(s)."
     else:
         status["mensagem"] = "Todos atualizados."
+    status["online"] = esta_online()
     return status
 
 @app.get("/api/csvs-antigos")
@@ -1017,7 +1365,7 @@ def status_dados():
             "intervalo_horas": INTERVALO_VERIFICACAO_HORAS,
             "rodando": scheduler.running if 'scheduler' in globals() else False,
         },
-        "carregados_configurado": True,
+        "online": esta_online(),
     }
     for produto in PRODUTOS:
         caminho = obter_csv_mais_recente(produto)
@@ -1027,16 +1375,19 @@ def status_dados():
             "idade_dias": round(idade, 2) if idade is not None else None,
             "fonte_dado": "csv_anp_atual" if (idade is not None and idade <= IDADE_MAXIMA_CSV_DIAS) else ("csv_anp_antigo" if caminho else "sem_csv"),
         }
-    try:
-        test = testar_api_anp()
-        resultado["api_anp"] = {
-            "status": "ok" if test.get("status_code") == 200 and test.get("total_items", 0) > 0 else "degradado",
-            "status_code": test.get("status_code"),
-            "total_items": test.get("total_items"),
-            "erro": test.get("erro"),
-        }
-    except Exception as e:
-        resultado["api_anp"] = {"status": "erro", "erro": str(e)}
+    if esta_online():
+        try:
+            test = testar_api_anp()
+            resultado["api_anp"] = {
+                "status": "ok" if test.get("total_items", 0) > 0 else "degradado",
+                "total_items": test.get("total_items"),
+                "total_registro_anp": test.get("total_registro_anp"),
+                "erro": test.get("erro_geral"),
+            }
+        except Exception as e:
+            resultado["api_anp"] = {"status": "erro", "erro": str(e)}
+    else:
+        resultado["api_anp"] = {"status": "offline"}
     for prod in ["gasolina", "diesel", "glp", "gnv"]:
         dados = raspar_composicao_petrobras(prod)
         resultado["petrobras"][prod] = {
@@ -1099,8 +1450,10 @@ def _parse_numero_simples(txt: str):
         return None
 
 def _scrape_petrobras_pagina(url: str):
+    if not esta_online():
+        return None
     try:
-        r = _sessao.get(url, timeout=25, allow_redirects=True)
+        r = requests.get(url, headers=HEADERS_NAVEGADOR, timeout=TIMEOUT_PETROBRAS, allow_redirects=True)
         if r.status_code != 200:
             print(f"⚠️ [Petrobras] HTTP {r.status_code} em {url}")
             return None
@@ -1247,7 +1600,7 @@ def debug_petrobras(uf: str = "SP", produto: str = "gasolina"):
         raise HTTPException(status_code=400, detail="Produto inválido")
     url = f"https://precos.petrobras.com.br/w/preco-{slug}-{uf.lower()}"
     try:
-        r = _sessao.get(url, timeout=25, allow_redirects=True)
+        r = requests.get(url, headers=HEADERS_NAVEGADOR, timeout=TIMEOUT_PETROBRAS, allow_redirects=True)
         if r.status_code != 200:
             return {"erro": f"HTTP {r.status_code}", "url": url}
         soup = BeautifulSoup(r.content, "html.parser")
@@ -1325,6 +1678,19 @@ def raspar_composicao_petrobras(produto="gasolina", uf="BR"):
             os.remove(_petrobras_cache_path(produto_norm, uf_norm))
         except Exception:
             pass
+
+    if not esta_online():
+        caminho = _petrobras_cache_path(produto_norm, uf_norm)
+        if os.path.exists(caminho):
+            try:
+                with open(caminho, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if cached.get("dados"):
+                    cached["dados"]["cache_origem"] = "disco_expirado_offline"
+                    return cached["dados"]
+            except Exception:
+                pass
+        return None
 
     dados_estado, url_estado_usada = (None, None)
     if uf_norm != "BR":
@@ -1408,7 +1774,7 @@ def get_composicao(uf: str = "BR", produto: str = "gasolina"):
             if k not in dados or not dados.get(k):
                 dados[k] = v
         dados["fonte"] = "fallback_estatico"
-        dados["aviso"] = "Não foi possível obter todos os componentes do scraping da Petrobras. Exibindo valores de referência."
+        dados["aviso"] = "Não foi possível obter todos os componentes. Exibindo valores de referência."
     else:
         dados["fonte"] = "scraping_petrobras"
         if produto_lower in ("glp", "gnv"):
@@ -1484,9 +1850,7 @@ def anp_resumo(uf: str, produto: str = "gasolina"):
                 periodo = {"data_inicial": f"{d}/{mo}/{y}", "data_final": f"{d}/{mo}/{y}"}
 
         return {
-            "uf": uf,
-            "produto": produto,
-            "escopo": "estado",
+            "uf": uf, "produto": produto, "escopo": "estado",
             "minimo": round(min(precos), 2),
             "media":  round(sum(precos) / len(precos), 2),
             "maximo": round(max(precos), 2),
@@ -1541,7 +1905,8 @@ def petrobras_cache_limpar():
 
 # ======================== ELETROPOSTOS (OCM + Carregados) ========================
 def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results: int = 500):
-    """OCM — API pública, gratuita, sem token obrigatório. Fonte principal."""
+    if not esta_online():
+        return []
     try:
         params = {
             "key": OCM_API_KEY, "output": "json",
@@ -1549,7 +1914,7 @@ def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results
             "distance": raio_km, "distanceunit": "KM",
             "maxresults": max_results, "compact": True, "verbose": True,
         }
-        r = _sessao.get(f"{OCM_BASE_URL}/poi/", params=params, timeout=45)
+        r = requests.get(f"{OCM_BASE_URL}/poi/", params=params, headers=HEADERS_NAVEGADOR, timeout=45)
         if r.status_code != 200:
             return []
         try:
@@ -1560,14 +1925,8 @@ def _buscar_eletropostos_ocm(lat: float, lon: float, raio_km: float, max_results
         print(f"⚠️ [OCM] erro de rede: {e}")
         return []
 
-def _buscar_eletropostos_carregados(lat: float, lon: float, raio_km: float):
-    """Carregados CLI — consulta por coordenada não suportada. Retorna []."""
-    print("ℹ️ [Carregados] consulta por coordenada não suportada. Pulando.")
-    return []
-
 def _buscar_eletropostos_carregados_por_cidade(municipio: str, uf: str):
-    """Busca eletropostos do Carregados CLI filtrando por cidade e estado."""
-    if not municipio or not uf:
+    if not municipio or not uf or not esta_online():
         return []
     try:
         cmd = f'{CARREGADOS_CLI} stations search --estado "{uf}" --cidade "{municipio}" --json'
@@ -1677,7 +2036,6 @@ def _formatar_eletroposto_carregados(item, lat_origem=None, lon_origem=None):
     }
 
 def _fundir_eletropostos(ocm_lista: list, carregados_lista: list) -> list:
-    """Funde OCM + Carregados, removendo duplicatas por coordenada (~100m). Carregados tem prioridade."""
     unicos = {}
     for est in carregados_lista:
         if est.get("latitude") and est.get("longitude"):
@@ -1767,6 +2125,9 @@ def eletropostos_cache_info():
 # ======================== AGENDADOR ========================
 def verificar_e_baixar_novos_csvs():
     print(f"\n🔍 [AGENDADOR] Verificando CSVs...")
+    if not esta_online():
+        print("📴 [AGENDADOR] offline — nada a fazer")
+        return
     resultado = garantir_todos_csvs(force_rebaixar_antigos=True)
     for produto, info in resultado.items():
         print(f"  {produto}: {info.get('acao')} (ok={info.get('ok')})")
@@ -1784,11 +2145,12 @@ scheduler.add_job(
 def iniciar_agendador():
     scheduler.start()
     print(f"⏰ Agendador iniciado (intervalo: {INTERVALO_VERIFICACAO_HORAS}h).")
-    print("✅ [Eletropostos] Fontes: Open Charge Map (principal) + Carregados CLI (complementar)")
-    try:
-        garantir_todos_csvs(force_rebaixar_antigos=True)
-    except Exception as e:
-        print(f"⚠️ [startup] erro ao garantir CSVs: {e}")
+    print(f"🌐 Online agora: {esta_online()}")
+    threading.Thread(
+        target=garantir_todos_csvs,
+        kwargs={"force_rebaixar_antigos": True},
+        daemon=True,
+    ).start()
 
 @app.on_event("shutdown")
 def parar_agendador():

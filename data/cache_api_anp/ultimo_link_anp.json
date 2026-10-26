@@ -1,14 +1,14 @@
 {
   "gasolina-etanol": {
     "url": "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-gasolina-etanol.csv",
-    "_ts": 1791817291.9676485
+    "_ts": 1792961995.7709374
   },
   "diesel-gnv": {
     "url": "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-diesel-gnv.csv",
-    "_ts": 1791817309.636978
+    "_ts": 1792962014.2808168
   },
   "glp": {
     "url": "https://www.gov.br/anp/pt-br/centrais-de-conteudo/dados-abertos/arquivos/shpc/qus/ultimas-4-semanas-glp.csv",
-    "_ts": 1791817315.8328676
+    "_ts": 1792962019.815425
   }
 }
